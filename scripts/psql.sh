@@ -7,11 +7,15 @@
 #
 # Options: -d DB  (default $PG_STA_PGDATABASE, i.e. pg_sta_qa)
 #          -X/-q/-A/-t  psql flags passed straight through
+#
+# The script works both on the workstation (over SSH) and on the VM itself
+# (through the local psql client); the transport is detected automatically.
 set -euo pipefail
 
-PG_STA_HOST=${PG_STA_HOST:-127.0.0.1}
-PG_STA_SSH_PORT=${PG_STA_SSH_PORT:-2201}
-PG_STA_SSH_KEY=${PG_STA_SSH_KEY:-$HOME/.vagrant.d/insecure_private_key}
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/pg_sta_conn.sh
+. "$HERE/pg_sta_conn.sh"
+
 PG_STA_PGDATABASE=${PG_STA_PGDATABASE:-pg_sta_qa}
 
 DB="$PG_STA_PGDATABASE"
@@ -29,6 +33,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+pg_sta_resolve_mode
+
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 
@@ -41,7 +47,4 @@ esac
 FLAGSTR=""
 for f in "${PSQL_FLAGS[@]}"; do FLAGSTR="$FLAGSTR $f"; done
 
-ssh -i "$PG_STA_SSH_KEY" -p "$PG_STA_SSH_PORT" \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    "vagrant@$PG_STA_HOST" \
-    "sudo -u postgres psql$FLAGSTR -d '$DB'" < "$TMP"
+pg_sta_psql "$DB" "$FLAGSTR" < "$TMP"

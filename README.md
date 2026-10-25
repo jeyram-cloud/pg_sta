@@ -99,6 +99,11 @@ Or from the command line:
 ./scripts/pg_sta_ctl --database appdb report
 ```
 
+The command line client picks its transport automatically: it talks to the
+development VM over SSH when the VM is reachable, and falls back to the
+local `psql` client when the script runs on the database host itself. Use
+`--ssh` or `--local` to force one of the two.
+
 **Full step-by-step instructions: [docs/usage.md](docs/usage.md)**
 
 ### Download options
@@ -256,11 +261,12 @@ pg_sta/
 ├── expected/pg_sta.out      recorded regression output
 ├── scripts/
 │   ├── pg_sta_ctl           command line client
+│   ├── pg_sta_conn.sh       shared connection helpers (SSH or local psql)
 │   ├── sync.sh              copy the tree to the VM
 │   ├── build.sh             compile on the VM
 │   ├── install.sh           sync + build + install
 │   ├── reload.sh            reload the extension
-│   ├── psql.sh              psql as postgres over SSH
+│   ├── psql.sh              psql as postgres over SSH or locally
 │   └── installcheck.sh      run the regression suite
 ├── test/
 │   ├── qa_setup.sql         deliberate-defect fixture, split into phases

@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # Copy the pg_sta source tree to the development VM.
+#
+# On the workstation the tree is pushed over SSH to PG_STA_REMOTE.  On the VM
+# itself the tree is already the target tree, so nothing is copied.
 set -euo pipefail
 
-PG_STA_HOST=${PG_STA_HOST:-127.0.0.1}
-PG_STA_SSH_PORT=${PG_STA_SSH_PORT:-2201}
-PG_STA_SSH_KEY=${PG_STA_SSH_KEY:-$HOME/.vagrant.d/insecure_private_key}
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/pg_sta_conn.sh
+. "$HERE/pg_sta_conn.sh"
+
 PG_STA_REMOTE=${PG_STA_REMOTE:-/home/vagrant/pg_sta}
-PG_STA_SRC=${PG_STA_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+PG_STA_SRC=${PG_STA_SRC:-$(cd "$HERE/.." && pwd)}
+
+pg_sta_resolve_mode
+
+if [ "$PG_STA_MODE" = "local" ]; then
+    echo "==> local mode: $PG_STA_SRC is already the target tree"
+    exit 0
+fi
 
 echo "==> rsync $PG_STA_SRC/ -> vagrant@$PG_STA_HOST:$PG_STA_REMOTE/ (port $PG_STA_SSH_PORT)"
 rsync -az --delete --delete-excluded \

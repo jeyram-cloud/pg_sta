@@ -451,15 +451,43 @@ The verdict is one of:
 `scripts/pg_sta_ctl` wraps the whole API.
 
 ```bash
-# over SSH to the development VM (default)
+# the transport is detected automatically: SSH to the development VM when the
+# VM is reachable, the local psql client otherwise
 ./scripts/pg_sta_ctl --database appdb report
 
-# against a local server
-./scripts/pg_sta_ctl --local --database appdb report
+# force the transport
+./scripts/pg_sta_ctl --ssh    --database appdb report   # over SSH to the VM
+./scripts/pg_sta_ctl --local  --database appdb report   # local psql client
 
 # machine readable output
-./scripts/pg_sta_ctl --local -d appdb -o json report > findings.json
-./scripts/pg_sta_ctl --local -d appdb -o markdown report > findings.md
+./scripts/pg_sta_ctl -d appdb -o json report > findings.json
+./scripts/pg_sta_ctl -d appdb -o markdown report > findings.md
+```
+
+The scripts work unchanged on the workstation and on the database host
+itself. On the host, the local `psql` client is used and it connects
+through the unix socket in `/var/run/postgresql` as the `postgres` user:
+
+```bash
+# on the database host, as the postgres user
+cd /var/lib/pgsql/pg_sta
+./scripts/pg_sta_ctl --database appdb report
+```
+
+When the transport falls back to the local client the scripts say so once:
+
+```
+pg_sta: no SSH access to 127.0.0.1:2201; using the local psql client
+```
+
+Every command except `install`, `regress` and `qa` first checks that the
+`pg_sta` extension exists in the target database and reports what to do
+when it does not:
+
+```
+pg_sta_ctl: the pg_sta extension is not installed in database 'appdb'.
+             Install it with:
+               sudo -u postgres psql -d 'appdb' -c 'CREATE EXTENSION pg_sta;'
 ```
 
 | Command | What it does |
@@ -677,6 +705,9 @@ LIMIT 20;
 |---|---|---|
 | `make: *** No targets specified and no makefile found.` | Wrong directory — there is no Makefile in `/var/lib/pgsql` or in `/usr/pgsql-17/bin` | `cd` into the pg_sta source tree (on the VM: `/home/vagrant/pg_sta`) |
 | `make: *** No rule to make target 'install'.` | Same as above, plus a missing `PGXS` include | `cd` into the source tree; check that `pg_config --pgxs` resolves |
+| `ssh: connect to host 127.0.0.1 port 2201: Connection refused` and `Warning: Identity file .../.vagrant.d/insecure_private_key not accessible` | The CLI was run **on the database host**, where the Vagrant port forward does not exist, and the SSH key of the workstation is not present | The CLI now falls back to the local `psql` client automatically and says so. To force it: `--local`. On the host the key path is irrelevant |
+| `pg_sta_ctl: the pg_sta extension is not installed in database 'appdb'.` | The extension was created in another database only | `sudo -u postgres psql -d appdb -c 'CREATE EXTENSION pg_sta;'` |
+| `pg_sta: 'make install' needs root privileges and 'sudo' is not usable for the current user` | `make install` writes into the PostgreSQL tree and needs root, but the current account has no usable `sudo` | Run the build as `root`, or as `vagrant`, which has passwordless `sudo` |
 | `curl: (22) The requested URL returned error: 404` | The branch or commit name in the tarball URL is wrong | Use `main`, or the exact commit SHA from `git ls-remote` |
 | `ERROR: extension "pg_sta" is not available` | Not installed into the PostgreSQL tree | `sudo make PG_CONFIG=... install`, then restart nothing — `CREATE EXTENSION` picks it up |
 | `ERROR: could not access file "$libdir/pg_sta"` | `pg_sta.so` missing or stale | Re-run `make install`; check `pg_config --pkglibdir` |

@@ -16,53 +16,55 @@
 #   test/run_qa.sh              run against the default QA database
 #   test/run_qa.sh -d mydb     run against another database
 #
+# The suite runs on the development VM over SSH when it is started on the
+# workstation, and locally when it is started on the VM itself.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
+# shellcheck source=../scripts/pg_sta_conn.sh
+. "$ROOT/scripts/pg_sta_conn.sh"
 
-PG_STA_HOST=${PG_STA_HOST:-127.0.0.1}
-PG_STA_SSH_PORT=${PG_STA_SSH_PORT:-2201}
-PG_STA_SSH_KEY=${PG_STA_SSH_KEY:-$HOME/.vagrant.d/insecure_private_key}
 PG_STA_PGDATABASE=${PG_STA_PGDATABASE:-pg_sta_qa}
 
 while [ $# -gt 0 ]; do
     case "$1" in
         -d) PG_STA_PGDATABASE="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,20p' "$0"; exit 0 ;;
+            sed -n '2,24p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
-SSH=(ssh -i "$PG_STA_SSH_KEY" -p "$PG_STA_SSH_PORT"
-     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-     -o LogLevel=ERROR)
+pg_sta_resolve_mode
 
-# The QA files are copied to the VM because /home/vagrant is not traversable
-# by the postgres user.
-WORKDIR=/tmp/pg_sta_qa_run
+AS_PG=$(pg_sta_postgres_prefix)
+
+# The QA files are staged in a work directory because the source tree may
+# not be readable by the postgres user.
+WORKDIR=${PG_STA_WORKDIR:-/tmp/pg_sta_qa_run}
 SETUP="$WORKDIR/qa_setup.sql"
 ASSERT="$WORKDIR/qa_assertions.sql"
 
-echo "==> staging QA files to $PG_STA_HOST:$WORKDIR"
-"${SSH[@]}" "vagrant@$PG_STA_HOST" "mkdir -p '$WORKDIR' && chmod 755 '$WORKDIR'"
-scp -q -i "$PG_STA_SSH_KEY" -P "$PG_STA_SSH_PORT" \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-    "$ROOT/test/qa_setup.sql"       "vagrant@$PG_STA_HOST:$SETUP"
-scp -q -i "$PG_STA_SSH_KEY" -P "$PG_STA_SSH_PORT" \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-    "$ROOT/test/qa_assertions.sql"  "vagrant@$PG_STA_HOST:$ASSERT"
+if [ "$PG_STA_MODE" = "ssh" ]; then
+    echo "==> staging QA files to $PG_STA_HOST:$WORKDIR"
+else
+    echo "==> staging QA files in $WORKDIR"
+fi
+
+pg_sta_ssh "mkdir -p '$WORKDIR' && chmod 755 '$WORKDIR'"
+pg_sta_push "$ROOT/test/qa_setup.sql"      "$SETUP"
+pg_sta_push "$ROOT/test/qa_assertions.sql" "$ASSERT"
 chmod 644 "$SETUP" "$ASSERT" 2>/dev/null || true
 
 echo "==> ensuring database '$PG_STA_PGDATABASE' and extension exist"
-"${SSH[@]}" "vagrant@$PG_STA_HOST" "
+pg_sta_ssh "
     set -e
-    sudo -u postgres psql -X -tAc \"SELECT 1 FROM pg_database WHERE datname='$PG_STA_PGDATABASE'\" \
-        | grep -q 1 || sudo -u postgres createdb '$PG_STA_PGDATABASE'
-    sudo -u postgres psql -X -tAc \"SELECT 1 FROM pg_extension WHERE extname='pg_sta'\" \
+    $AS_PG psql -X -tAc \"SELECT 1 FROM pg_database WHERE datname='$PG_STA_PGDATABASE'\" \
+        | grep -q 1 || $AS_PG createdb '$PG_STA_PGDATABASE'
+    $AS_PG psql -X -tAc \"SELECT 1 FROM pg_extension WHERE extname='pg_sta'\" \
         -d '$PG_STA_PGDATABASE' | grep -q 1 \
-        || sudo -u postgres psql -X -d '$PG_STA_PGDATABASE' -c 'CREATE EXTENSION pg_sta'
+        || $AS_PG psql -X -d '$PG_STA_PGDATABASE' -c 'CREATE EXTENSION pg_sta'
 "
 
 echo "==> running QA setup"
@@ -88,18 +90,15 @@ awk -v out="$PHASES" '
 
 for f in "$PHASES"/phase_*.sql; do
     [ -s "$f" ] || continue
-    scp -q -i "$PG_STA_SSH_KEY" -P "$PG_STA_SSH_PORT" \
-        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-        "$f" "vagrant@$PG_STA_HOST:$WORKDIR/$(basename "$f")"
+    pg_sta_push "$f" "$WORKDIR/$(basename "$f")"
 done
 
 for f in "$PHASES"/phase_*.sql; do
     [ -s "$f" ] || continue
     name=$(basename "$f")
     echo "    -> $name"
-    "${SSH[@]}" "vagrant@$PG_STA_HOST" "
-        sudo -u postgres psql -X -q -v ON_ERROR_STOP=1 -d '$PG_STA_PGDATABASE' -f '$WORKDIR/$name'
-    " || { echo "!! QA setup failed in $name"; rm -rf "$PHASES"; exit 1; }
+    pg_sta_ssh "$AS_PG psql -X -q -v ON_ERROR_STOP=1 -d '$PG_STA_PGDATABASE' -f '$WORKDIR/$name'" \
+        || { echo "!! QA setup failed in $name"; rm -rf "$PHASES"; exit 1; }
 done
 rm -rf "$PHASES"
 
@@ -107,9 +106,7 @@ echo "==> running QA assertions"
 OUT=$(mktemp)
 trap 'rm -f "$OUT"' EXIT
 
-"${SSH[@]}" "vagrant@$PG_STA_HOST" "
-    sudo -u postgres psql -X -q -v ON_ERROR_STOP=1 -d '$PG_STA_PGDATABASE' -f '$ASSERT'
-" > "$OUT" 2>&1
+pg_sta_ssh "$AS_PG psql -X -q -v ON_ERROR_STOP=1 -d '$PG_STA_PGDATABASE' -f '$ASSERT'" > "$OUT" 2>&1
 RC=$?
 
 if [ "$RC" -ne 0 ]; then

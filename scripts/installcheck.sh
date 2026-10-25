@@ -11,14 +11,16 @@
 #
 # The "results" directory and the diff file are copied back to the host so
 # that a failing run can be inspected.
+#
+# The suite runs on the VM over SSH when the script is started on the
+# workstation, and in a local copy of the tree when it is started on the VM.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
+# shellcheck source=scripts/pg_sta_conn.sh
+. "$HERE/pg_sta_conn.sh"
 
-PG_STA_HOST=${PG_STA_HOST:-127.0.0.1}
-PG_STA_SSH_PORT=${PG_STA_SSH_PORT:-2201}
-PG_STA_SSH_KEY=${PG_STA_SSH_KEY:-$HOME/.vagrant.d/insecure_private_key}
 PG_STA_REMOTE=${PG_STA_REMOTE:-/home/vagrant/pg_sta}
 PG_STA_PG_CONFIG=${PG_STA_PG_CONFIG:-/usr/pgsql-17/bin/pg_config}
 PG_STA_TESTDB=${PG_STA_TESTDB:-pg_sta_regress}
@@ -36,42 +38,42 @@ done
 # looks like the result of this run.  Remove it before starting.
 rm -f "$ROOT/regression.diffs"
 
-"$HERE/sync.sh" >/dev/null
+pg_sta_resolve_mode
 
-echo "==> running the regression suite on vagrant@$PG_STA_HOST:$PG_STA_SSH_PORT"
+# The tree that carries the test files: the synced copy on the VM, or the
+# local tree when the suite runs on the VM itself.
+TREE=$(pg_sta_target_tree)
+AS_PG=$(pg_sta_postgres_prefix)
 
-ssh -i "$PG_STA_SSH_KEY" -p "$PG_STA_SSH_PORT" \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    "vagrant@$PG_STA_HOST" "
-set -e
-rm -rf '$PG_STA_WORKDIR' 2>/dev/null || sudo rm -rf '$PG_STA_WORKDIR'
+if [ "$PG_STA_MODE" = "ssh" ]; then
+    "$HERE/sync.sh" >/dev/null
+    echo "==> running the regression suite on vagrant@$PG_STA_HOST:$PG_STA_SSH_PORT"
+else
+    echo "==> running the regression suite locally in $PG_STA_WORKDIR"
+fi
+
+CMD="set -e
+rm -rf '$PG_STA_WORKDIR' 2>/dev/null || sudo rm -rf '$PG_STA_WORKDIR' 2>/dev/null || true
 mkdir -p '$PG_STA_WORKDIR'
-cp -a '$PG_STA_REMOTE/.' '$PG_STA_WORKDIR/'
-sudo chown -R postgres:postgres '$PG_STA_WORKDIR'
-sudo -u postgres psql -tAc \"SELECT 1 FROM pg_database WHERE datname='$PG_STA_TESTDB'\" | grep -q 1 \
-    || sudo -u postgres createdb '$PG_STA_TESTDB'
+cp -a '$TREE/.' '$PG_STA_WORKDIR/'
+sudo chown -R postgres:postgres '$PG_STA_WORKDIR' 2>/dev/null || true
+$AS_PG psql -tAc \"SELECT 1 FROM pg_database WHERE datname='$PG_STA_TESTDB'\" | grep -q 1 \
+    || $AS_PG createdb '$PG_STA_TESTDB'
 cd '$PG_STA_WORKDIR'
-sudo -u postgres env PATH=/usr/pgsql-17/bin:\$PATH PGHOST=/var/run/postgresql \
+$AS_PG env PATH=/usr/pgsql-17/bin:\$PATH PGHOST=/var/run/postgresql \
     make installcheck PG_CONFIG='$PG_STA_PG_CONFIG' \
     REGRESS_OPTS='--dbname=$PG_STA_TESTDB' 2>&1 | tail -40
-exit \${PIPESTATUS[0]}
-" && RC=0 || RC=$?
+exit \${PIPESTATUS[0]}"
+
+pg_sta_ssh "$CMD" && RC=0 || RC=$?
 
 # Copy the artefacts back so that a failure can be inspected on the host.
-scp -q -i "$PG_STA_SSH_KEY" -P "$PG_STA_SSH_PORT" \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    "vagrant@$PG_STA_HOST:$PG_STA_WORKDIR/results/pg_sta.out" \
-    "$ROOT/expected/pg_sta.out.actual" 2>/dev/null || true
+pg_sta_pull "$PG_STA_WORKDIR/results/pg_sta.out" "$ROOT/expected/pg_sta.out.actual" 2>/dev/null || true
+
 # pg_regress removes regression.diffs when the suite passes, so a missing
 # file means "no differences".  Copy it back only when it exists.
-if ssh -i "$PG_STA_SSH_KEY" -p "$PG_STA_SSH_PORT" \
-        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR "vagrant@$PG_STA_HOST" \
-        "test -f '$PG_STA_WORKDIR/regression.diffs'" 2>/dev/null; then
-    scp -q -i "$PG_STA_SSH_KEY" -P "$PG_STA_SSH_PORT" \
-        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        "vagrant@$PG_STA_HOST:$PG_STA_WORKDIR/regression.diffs" \
-        "$ROOT/regression.diffs" 2>/dev/null || true
+if pg_sta_target_exists "$PG_STA_WORKDIR/regression.diffs"; then
+    pg_sta_pull "$PG_STA_WORKDIR/regression.diffs" "$ROOT/regression.diffs" 2>/dev/null || true
 else
     echo "==> no differences (regression.diffs not produced)"
 fi

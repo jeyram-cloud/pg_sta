@@ -99,16 +99,46 @@ SQL script, because the script is re-executed from scratch on every run.
 cat some.sql | ./scripts/psql.sh -d pg_sta_qa
 ```
 
-`psql.sh` connects as `postgres` over SSH with `ON_ERROR_STOP=1`, so a
+`psql.sh` connects as `postgres` with `ON_ERROR_STOP=1`, so a
 failing script stops at the failing statement instead of running to the
 end.
 
-### 3.4 Environment variables
+### 3.4 Connection helper
+
+Every script in `scripts/` and `test/` reaches the database through the
+same helper, `scripts/pg_sta_conn.sh`. It resolves the transport once:
+
+| Mode | When it is used | How it connects |
+|---|---|---|
+| `ssh` | the VM is reachable: the private key is readable and the forwarded port answers | `ssh vagrant@127.0.0.1:2201` → `sudo -u postgres psql` |
+| `local` | the script runs on the VM itself, or the VM is not reachable | the local `psql` client over the socket in `/var/run/postgresql`, as `postgres` |
+
+The mode is chosen automatically, so the same command works on the
+workstation and on the database host:
+
+```bash
+# on the workstation -> talks to the VM over SSH
+./scripts/pg_sta_ctl --database appdb report
+
+# on the database host -> uses the local psql client
+./scripts/pg_sta_ctl --database appdb report
+```
+
+`--ssh` and `--local` force one of the two, and `PG_STA_MODE=ssh|local`
+does the same for the helper scripts. When the fallback to the local client
+happens, the scripts say so once:
+
+```
+pg_sta: no SSH access to 127.0.0.1:2201; using the local psql client
+```
+
+### 3.5 Environment variables
 
 Every script accepts these overrides:
 
 | Variable | Default |
 |---|---|
+| `PG_STA_MODE` | `auto` (`ssh` or `local`, detected) |
 | `PG_STA_HOST` | `127.0.0.1` |
 | `PG_STA_SSH_PORT` | `2201` |
 | `PG_STA_SSH_KEY` | `$HOME/.vagrant.d/insecure_private_key` |
@@ -266,6 +296,7 @@ The rules that keep them safe:
 | The QA suite reports unexpected counts | the fixture was not re-seeded, or a phase shared a session | re-run `./test/run_qa.sh` from the top |
 | `pg_stat_statements` has no rows | the extension is not loaded | check `SHOW shared_preload_libraries;` |
 | The SSH connection is refused | the VM is not running | `cd /Users/jey/postgres17 && vagrant up pgnode17` |
+| `ssh: connect to host 127.0.0.1 port 2201: Connection refused` together with `Identity file ... not accessible` | the script runs **on the VM**, where the port forward does not exist and the workstation key is not present | the scripts fall back to the local `psql` client automatically and say so; force it with `--local` or `PG_STA_MODE=local` |
 
 ---
 

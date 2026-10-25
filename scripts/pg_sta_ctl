@@ -9,12 +9,15 @@
 #
 # Connection
 # ----------
-# Two modes are supported:
+# Three modes are supported:
 #
 #   --local   use the local psql client and the standard PG* environment
 #             variables (PGHOST, PGPORT, PGUSER, PGDATABASE, PGPASSWORD)
-#   --ssh     (default) run psql as the postgres user on the development VM
-#             over SSH, using PG_STA_HOST / PG_STA_SSH_PORT / PG_STA_SSH_KEY
+#   --ssh     run psql as the postgres user on the development VM over SSH,
+#             using PG_STA_HOST / PG_STA_SSH_PORT / PG_STA_SSH_KEY
+#   default   "auto": the SSH hop is used when it is usable and the local
+#             psql client is used otherwise.  The scripts therefore work
+#             unchanged both on the workstation and on the VM itself.
 #
 # Usage
 # -----
@@ -70,13 +73,10 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 
-PG_STA_HOST=${PG_STA_HOST:-127.0.0.1}
-PG_STA_SSH_PORT=${PG_STA_SSH_PORT:-2201}
-PG_STA_SSH_KEY=${PG_STA_SSH_KEY:-$HOME/.vagrant.d/insecure_private_key}
-PG_STA_PGDATABASE=${PG_STA_PGDATABASE:-postgres}
+# shellcheck source=scripts/pg_sta_conn.sh
+. "$HERE/pg_sta_conn.sh"
 
 DB="$PG_STA_PGDATABASE"
-MODE=ssh
 OUTPUT=text
 LIMIT=50
 WINDOW=window
@@ -95,7 +95,8 @@ QID_ARG=""
 die() { echo "pg_sta_ctl: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'
+    # Print the header comment block, minus the leading "# " markers.
+    awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
 }
 
 # --------------------------------------------------------------------------
@@ -104,8 +105,8 @@ usage() {
 while [ $# -gt 0 ]; do
     case "$1" in
         -d|--database) DB="$2"; shift 2 ;;
-        --local)       MODE=local; shift ;;
-        --ssh)         MODE=ssh; shift ;;
+        --local)       PG_STA_MODE=local; shift ;;
+        --ssh)         PG_STA_MODE=ssh; shift ;;
         -o|--output)   OUTPUT="$2"; shift 2 ;;
         --limit)       LIMIT="$2"; shift 2 ;;
         --window)      WINDOW="$2"; shift 2 ;;
@@ -191,17 +192,29 @@ run_sql() {
     tmp=$(mktemp)
     cat > "$tmp"
 
-    if [ "$MODE" = "local" ]; then
-        # shellcheck disable=SC2086
-        psql -X -v ON_ERROR_STOP=1 $flags -d "$DB" < "$tmp"
-        rm -f "$tmp"
-    else
-        ssh -i "$PG_STA_SSH_KEY" -p "$PG_STA_SSH_PORT" \
-            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o LogLevel=ERROR \
-            "vagrant@$PG_STA_HOST" \
-            "sudo -u postgres psql -X -v ON_ERROR_STOP=1 $flags -d '$DB'" < "$tmp"
-        rm -f "$tmp"
+    pg_sta_psql "$DB" "$flags" < "$tmp"
+    local rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
+# Make sure the target database exists and carries the pg_sta extension.
+# Without this check the commands fail with the rather cryptic
+# "relation sta.recommendations does not exist".
+require_extension() {
+    local out
+    out=$(printf '%s\n' "SELECT count(*) FROM pg_extension WHERE extname = 'pg_sta';" \
+          | pg_sta_psql "$DB" "-q -A -t" 2>&1) || {
+        echo "$out" >&2
+        die "cannot connect to database '$DB' (mode: $PG_STA_MODE)"
+    }
+    if [ "$(printf '%s' "$out" | tr -d '[:space:]')" != "1" ]; then
+        {
+            echo "pg_sta_ctl: the pg_sta extension is not installed in database '$DB'."
+            echo "             Install it with:"
+            echo "               sudo -u postgres psql -d '$DB' -c 'CREATE EXTENSION pg_sta;'"
+        } >&2
+        exit 1
     fi
 }
 
@@ -308,6 +321,20 @@ render_advice() {
         json)     advice_json "$base"     | run_sql "-q -A -t" ;;
     esac
 }
+
+# --------------------------------------------------------------------------
+# Transport
+# --------------------------------------------------------------------------
+# Resolve "auto" into "ssh" or "local" once, so that every command uses the
+# same transport and the user is told which one was chosen.
+pg_sta_resolve_mode
+
+# The build and test commands create the extension themselves; every other
+# command reads it from the target database, so it has to be there already.
+case "$COMMAND" in
+    install|regress|qa) ;;
+    *) require_extension ;;
+esac
 
 # --------------------------------------------------------------------------
 # Commands
