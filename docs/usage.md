@@ -395,6 +395,14 @@ The verdict is one of:
 | `validate DDL SQL` | measure a proposed index against the current plan |
 | `queryid SQL` | the canonical query id and its normalised text |
 | `explain SQL` | the execution plan as JSON |
+| `plan-advice SQL` | PostgreSQL 19 style plan advice for one statement |
+| `advice ADVICE SQL` | plan one statement with an advice string applied |
+| `stash list` | list the advice stashes |
+| `stash create NAME` | create an advice stash |
+| `stash drop NAME` | drop an advice stash |
+| `stash show [NAME]` | show the contents of an advice stash |
+| `stash set NAME QID ADVICE` | store advice for a query id in a stash |
+| `stash remove NAME QID` | remove the advice stored for a query id |
 | `diff [SCHEMA]` | differences between the two most recent snapshots of a schema |
 | `record SCOPE [TARGET]` | record an advisory run in the audit trail |
 | `catalog` | the catalogue of every finding the advisor knows |
@@ -402,6 +410,39 @@ The verdict is one of:
 | `install` | build and install the extension |
 | `regress` | run the regression suite |
 | `qa` | run the QA suite |
+
+### 8.1 Plan advice and the advice stash
+
+The two commands that mirror the PostgreSQL 19 plan-advice features:
+
+```bash
+# what would PostgreSQL 19 advise for this statement?
+./scripts/pg_sta_ctl --database appdb plan-advice \
+    "SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id
+      WHERE c.region = 'eu'"
+
+# plan it with an advice string applied
+./scripts/pg_sta_ctl --database appdb advice "HASH_JOIN(c)" \
+    "SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id
+      WHERE c.region = 'eu'"
+```
+
+A stash stores advice per query id so that it can be applied later without
+repeating the advice string:
+
+```bash
+./scripts/pg_sta_ctl --database appdb stash create nightly
+./scripts/pg_sta_ctl --database appdb stash set nightly \
+    "$(./scripts/pg_sta_ctl --database appdb queryid 'SELECT 1' | head -1 | cut -d: -f2 | tr -d ' ')" \
+    "SEQ_SCAN(orders)"
+./scripts/pg_sta_ctl --database appdb stash show nightly
+./scripts/pg_sta_ctl --database appdb stash list
+./scripts/pg_sta_ctl --database appdb stash remove nightly <queryid>
+./scripts/pg_sta_ctl --database appdb stash drop nightly
+```
+
+The same operations from SQL are described in
+[pg19-compatibility.md](pg19-compatibility.md).
 
 Connection settings come from the environment:
 

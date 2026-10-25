@@ -185,7 +185,7 @@ accepts an improvement.
 The QA suite:
 
 1. creates the fixture `sta_qa` with deliberate defects,
-2. evaluates 50 assertions in `test/qa_assertions.sql`,
+2. evaluates 87 assertions in `test/qa_assertions.sql`,
 3. prints a pass/fail line per assertion and a summary.
 
 ```

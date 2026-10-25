@@ -296,6 +296,7 @@ DECLARE
     v_has_pgss  boolean;
     v_statements integer := 0;
     v_tables     integer := 0;
+    v_sample_id  bigint := 0;
 BEGIN
     v_has_pgss := EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements');
 
@@ -402,7 +403,20 @@ BEGIN
     JOIN pg_namespace ns ON ns.oid = t.relnamespace
     LEFT JOIN pg_stat_user_indexes s ON s.indexrelid = x.indexrelid;
 
-    RETURN QUERY SELECT currval(pg_get_serial_sequence('sta.workload_sample', 'sample_id')),
+    /*
+     * currval() only works once the sequence has been advanced in this
+     * session.  When pg_stat_statements is missing, or when it holds no
+     * statement for this database yet, no workload row was inserted and the
+     * sequence was never touched, so currval() would raise
+     * "currval of sequence ... is not yet defined in this session".  The
+     * row count tells us whether the sequence was advanced, so the sample
+     * id is only read when there is one to report.
+     */
+    IF v_statements > 0 THEN
+        v_sample_id := currval(pg_get_serial_sequence('sta.workload_sample', 'sample_id'));
+    END IF;
+
+    RETURN QUERY SELECT v_sample_id,
                         v_ts, v_statements, v_tables;
 END
 $$;
@@ -2751,6 +2765,7 @@ DECLARE
     v_state    text := '';
     v_applied  text[] := '{}';
     v_previous text;
+    v_seen     text[] := '{}';
 BEGIN
     -- A second apply starts from a clean baseline so that the recorded state
     -- always describes the values that were in force before any advice.
@@ -2773,10 +2788,16 @@ BEGIN
         LOOP
             v_previous := COALESCE(current_setting(v_guc.guc_name, true), '');
 
-            IF v_previous <> '' THEN
+            -- Only the value that was in force *before* any advice was applied
+            -- must be recorded.  A later advice item that touches the same
+            -- setting would otherwise record the value this function has just
+            -- written, and restore_advice() would then put back the advised
+            -- value instead of the original one.
+            IF v_previous <> '' AND NOT (v_guc.guc_name = ANY (v_seen)) THEN
                 v_state := v_state
                            || CASE WHEN v_state = '' THEN '' ELSE ';' END
                            || v_guc.guc_name || '=' || v_previous;
+                v_seen := v_seen || v_guc.guc_name;
             END IF;
 
             PERFORM set_config(v_guc.guc_name, v_guc.guc_value, false);
@@ -2815,6 +2836,7 @@ DECLARE
     v_name     text;
     v_value    text;
     v_restored text[] := '{}';
+    v_seen     text[] := '{}';
 BEGIN
     v_state := COALESCE(current_setting('pg_sta.advice_state', true), '');
 
@@ -2826,9 +2848,10 @@ BEGIN
         v_name  := split_part(v_part, '=', 1);
         v_value := split_part(v_part, '=', 2);
 
-        IF v_name <> '' AND v_value <> '' THEN
+        IF v_name <> '' AND v_value <> '' AND NOT (v_name = ANY (v_seen)) THEN
             PERFORM set_config(v_name, v_value, false);
             v_restored := array_append(v_restored, v_name || '=' || v_value);
+            v_seen := v_seen || v_name;
         END IF;
     END LOOP;
 

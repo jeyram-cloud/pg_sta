@@ -29,6 +29,13 @@ The extension is read-only by design: it never applies a change to the
 database.  The function sta.validate() measures a proposed index against
 the current plan inside a subtransaction and rolls it back again.
 
+The extension also reproduces the plan-advice features that PostgreSQL 19
+introduces: sta.plan_advice_string() generates PostgreSQL 19 style plan
+advice from an execution plan, and the advice stash API (sta.create_stash,
+sta.set_stashed_advice, sta.get_stash_contents and friends) mirrors
+pg_stash_advice.  Applying advice changes only the session settings of
+the caller and is always reversible with sta.restore_advice().
+
 %prep
 %setup -q
 
@@ -44,6 +51,9 @@ make install DESTDIR=%{buildroot} PG_CONFIG=/usr/pgsql-%{pgversion}/bin/pg_confi
 %{_datadir}/pgsql/extension/pg_sta--0.1.0.sql
 %license LICENSE
 %doc README.md
+%doc docs/usage.md
+%doc docs/advice-catalog.md
+%doc docs/pg19-compatibility.md
 
 %changelog
 * Mon Oct 25 2026 Jey <jey@example.com> - 0.1.0-1

@@ -332,3 +332,53 @@ SELECT * FROM sta.collect();
 
 DELETE FROM sta.workload_sample
  WHERE captured_at = (SELECT max(captured_at) FROM sta.workload_sample);
+
+-- =========================================================================
+-- Phase 9 -- plan-advice fixture
+-- =========================================================================
+--
+-- The plan-advice feature needs a join whose plan contains more than one
+-- node type, so that the generated advice exercises more than a single
+-- scan method.  The fixture lives in the QA schema like every other QA
+-- object and is never touched outside it.
+--
+-- "pa_fact" is the fact table, "pa_dim1" and "pa_dim2" are dimension
+-- tables.  The join between them is planned as a hash join over two
+-- sequential scans, which gives the advisor a SEQ_SCAN tag for the fact
+-- table and a join-method tag for the join.
+-- @phase 9
+
+SET client_min_messages = warning;
+
+DROP TABLE IF EXISTS sta_qa.pa_fact, sta_qa.pa_dim1, sta_qa.pa_dim2 CASCADE;
+
+CREATE TABLE sta_qa.pa_dim1 (
+    id   integer PRIMARY KEY,
+    dim1 text,
+    val1 int
+);
+
+CREATE TABLE sta_qa.pa_dim2 (
+    id   integer PRIMARY KEY,
+    dim2 text,
+    val2 int
+);
+
+CREATE TABLE sta_qa.pa_fact (
+    id      integer PRIMARY KEY,
+    dim1_id integer NOT NULL REFERENCES sta_qa.pa_dim1(id),
+    dim2_id integer NOT NULL REFERENCES sta_qa.pa_dim2(id)
+);
+
+INSERT INTO sta_qa.pa_dim1 (id, dim1, val1)
+SELECT g, 'filler ' || g, (g % 3) + 1 FROM generate_series(1, 100) g;
+
+INSERT INTO sta_qa.pa_dim2 (id, dim2, val2)
+SELECT g, 'filler ' || g, (g % 7) + 1 FROM generate_series(1, 1000) g;
+
+INSERT INTO sta_qa.pa_fact (id, dim1_id, dim2_id)
+SELECT g, (g % 100) + 1, (g % 100) + 1 FROM generate_series(1, 50000) g;
+
+ANALYZE sta_qa.pa_dim1;
+ANALYZE sta_qa.pa_dim2;
+ANALYZE sta_qa.pa_fact;

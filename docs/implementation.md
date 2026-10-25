@@ -170,6 +170,50 @@ Public functions:
 | `sta.explain_by_queryid(bigint, boolean)` | `jsonb` |
 | `sta.advice_catalog()` | the self-describing catalogue |
 
+### 3.1a The PostgreSQL 19 parity layer
+
+A second group of functions reproduces the plan-advice features that
+PostgreSQL 19 introduces. They live in the same `sta` schema and follow
+the PostgreSQL 19 naming as closely as a schema prefix allows.
+
+| Function | Returns | PostgreSQL 19 counterpart |
+|---|---|---|
+| `sta.plan_advice_string(text, boolean)` | `text` | `pg_plan_advice` |
+| `sta._advice_split(text)` | `text[]` | the advice lexer |
+| `sta._advice_parse(text)` | `(item, tag, targets)` | the advice parser |
+| `sta.apply_advice(text)` | `text[]` | — (PG19 hooks the planner) |
+| `sta.restore_advice()` | `text[]` | — |
+| `sta.explain_with_advice(text, text, boolean)` | `(plan, applied, restored)` | — |
+| `sta.run_with_advice(text, text, boolean)` | `jsonb` | — |
+| `sta.create_stash(text)` | `void` | `pg_create_advice_stash` |
+| `sta.drop_stash(text)` | `void` | `pg_drop_advice_stash` |
+| `sta.set_stashed_advice(text, bigint, text)` | `void` | `pg_set_stashed_advice` |
+| `sta.get_stashes()` | `(stash_name, num_entries)` | `pg_get_advice_stashes` |
+| `sta.get_stash_contents(text)` | `(stash_name, query_id, advice_string)` | `pg_get_advice_stash_contents` |
+| `sta.get_stashed_advice(bigint, text)` | `text` | — |
+| `sta.explain_with_stashed_advice(text, bigint, text, boolean)` | `(plan, applied, restored, advice)` | — |
+
+The tag catalogue is **data**, not code: `sta.plan_advice_tag` holds the 15
+tags with their category, description and enforcement level, and
+`sta.plan_advice_guc` maps each enforceable tag to the planner settings
+that implement it. `sta.plan_advice_tag_view` joins the two.
+
+Applying advice is a two-step operation that is always symmetric:
+
+1. `sta.apply_advice(advice)` translates the advice into planner settings,
+   records the previous values of the settings it changed in the
+   `pg_sta.advice_state` GUC, and returns the list of settings it changed.
+2. `sta.restore_advice()` puts the session back exactly as it was and
+   returns the list of settings it restored.
+
+Because the previous values are recorded rather than assumed, applying
+advice twice, or applying advice after the caller has changed a setting
+itself, still restores the session correctly.
+
+The full parity analysis — what is identical to PostgreSQL 19 and what is
+an approximation forced by the absence of a planner hook — is in
+[pg19-compatibility.md](pg19-compatibility.md).
+
 ### 3.2 The end-to-end data flow
 
 ```
@@ -223,6 +267,11 @@ Step by step:
    `to_jsonb()`, which is how they stay compatible across PostgreSQL
    versions whose catalog columns differ (the `blk_*_time` columns were
    split in 17; the per-table block I/O columns were removed in 16).
+
+   `sta.collect()` reports the id of the workload row it inserted. When
+   `pg_stat_statements` is missing, or holds no statement for the current
+   database yet, no row is inserted and the id is reported as `0` rather
+   than raising an error.
 
 2. **Explain.** `sta.explain()` calls the C core, which returns the plan as
    `jsonb`.
@@ -379,7 +428,7 @@ when the output differs. This catches *behavioural* changes.
 | `sta_qa.big_events` | 120 000 rows, hot query, no supporting index | `SEQ_SCAN_ON_LARGE_TABLE` |
 | `sta_qa.hot_path` | very high call count | `HIGH_FREQUENCY` |
 
-`test/qa_assertions.sql` contains 50 assertions in a machine-readable
+`test/qa_assertions.sql` contains 87 assertions in a machine-readable
 `assertion | expected | actual | passed` form. `test/run_qa.sh` runs the
 setup, then evaluates the assertions and reports the pass count.
 

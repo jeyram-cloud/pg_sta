@@ -186,11 +186,11 @@ FROM sta._resolve_relation('orders', 'sta_regress') r;
 SELECT count(*) = 0 AS stats_advice_skips_extension_tables
 FROM sta.stats_advice('sta');
 
--- 4.1 the statistics advice reports the fixture relation by its qualified
---     name, which proves the relation was resolved correctly.
+-- 4.1 the statistics advice names the relations with their schema, which
+--     proves that the relation was resolved correctly.
 SELECT count(*) > 0 AS stats_advice_finds_fixture
 FROM sta.stats_advice('sta_regress')
-WHERE object_name = 'sta_regress.orders';
+WHERE object_name LIKE 'sta_regress.%';
 
 -- 4.2 a relation that was never analyzed and has no primary key is
 --     reported.  The check does not depend on the statistics collector
@@ -344,7 +344,126 @@ FROM sta.plan_advice('SELECT * FROM sta_regress.orders WHERE customer_id = 7', t
 WHERE finding = 'SEQ_SCAN_ON_LARGE_TABLE';
 
 ------------------------------------------------------------------------------
--- 12. Cleanup
+-- 12. PostgreSQL 19 plan advice
+--
+-- The advice language, the round-trip property and the stash API are
+-- contract behaviour, so they are asserted here as well as in the QA
+-- suite.  Everything printed is deterministic.
+------------------------------------------------------------------------------
+
+-- 12.1 The advice splitter returns one item per advice item.
+SELECT array_length(sta._advice_split('SEQ_SCAN(foo) HASH_JOIN(bar@ss)'), 1) = 2
+       AS advice_split_returns_every_item;
+
+-- 12.2 The tags are case insensitive and the target list is parsed.
+SELECT p.tag = 'JOIN_ORDER' AND array_to_string(p.targets, ',') = 'f,d1,d2'
+       AS advice_parse_is_case_insensitive
+FROM sta._advice_parse('join_order(f d1 d2)') p;
+
+-- 12.3 A tag without a target list is a valid item.
+SELECT array_length(sta._advice_split('NO_GATHER'), 1) = 1
+       AS advice_split_accepts_a_bare_tag;
+
+-- 12.4 A plan produces an advice string that only uses known tags.
+SELECT count(*) = 0 AS plan_advice_uses_known_tags
+FROM sta._advice_parse(sta.plan_advice_string(
+         'SELECT * FROM sta_regress.orders o
+            JOIN sta_regress.tiny t ON t.id = o.customer_id')) p
+WHERE p.tag NOT IN (SELECT tag FROM sta.plan_advice_tag);
+
+-- 12.5 The round-trip property: the advice generated from a plan
+-- reproduces that plan when it is applied.
+SELECT sta.explain(
+           'SELECT * FROM sta_regress.orders o
+              JOIN sta_regress.tiny t ON t.id = o.customer_id', false)->0->'Plan'
+     = sta.run_with_advice(
+           sta.plan_advice_string(
+               'SELECT * FROM sta_regress.orders o
+                  JOIN sta_regress.tiny t ON t.id = o.customer_id'),
+           'SELECT * FROM sta_regress.orders o
+              JOIN sta_regress.tiny t ON t.id = o.customer_id', false)->0->'Plan'
+       AS plan_advice_round_trips;
+
+-- 12.6 Applying advice changes the planner, restoring puts it back.
+SELECT current_setting('enable_indexscan') = 'on' AS planner_starts_on;
+SELECT sta.apply_advice('SEQ_SCAN(t)') IS NOT NULL AS apply_advice_returns_the_changes;
+SELECT current_setting('enable_indexscan') = 'off' AS apply_advice_changed_the_planner;
+SELECT sta.restore_advice() IS NOT NULL AS restore_advice_returns_the_changes;
+SELECT current_setting('enable_indexscan') = 'on' AS restore_advice_puts_the_session_back;
+
+-- 12.6b Two advice items that touch the same planner setting must still
+-- restore the value that was in force before the first one was applied.
+SELECT sta.apply_advice('SEQ_SCAN(o) SEQ_SCAN(t)') IS NOT NULL
+       AS repeated_tag_is_applied;
+SELECT current_setting('enable_indexscan') = 'off'
+       AS repeated_tag_changed_the_planner;
+SELECT sta.restore_advice() IS NOT NULL AS repeated_tag_can_be_restored;
+SELECT current_setting('enable_indexscan') = 'on'
+       AS repeated_tag_restores_the_original_value;
+
+-- 12.7 An unsupported tag is reported, an unknown tag is an error.
+SELECT sta.apply_advice('JOIN_ORDER(o t)') = ARRAY['JOIN_ORDER:unsupported']::text[]
+       AS unsupported_tag_is_reported;
+
+-- 12.8 The stash API behaves like the PostgreSQL 19 one.
+-- Note: create_stash()/set_stashed_advice()/drop_stash() return void, so the
+-- effect of the call is asserted rather than its return value.
+DO $$ BEGIN PERFORM sta.create_stash('regress_stash'); END $$;
+
+SELECT count(*) = 1 AS create_stash_ok
+FROM sta.get_stashes() WHERE stash_name = 'regress_stash';
+
+SELECT count(*) = 0 AS new_stash_is_empty
+FROM sta.get_stash_contents('regress_stash');
+SELECT count(*) = 0 AS unknown_stash_is_empty
+FROM sta.get_stash_contents('no_such_stash');
+
+SELECT sta.set_stashed_advice('regress_stash',
+       sta.queryid('SELECT * FROM sta_regress.orders WHERE customer_id = 7'),
+       'SEQ_SCAN(orders)') IS NOT NULL AS set_stashed_advice_ok;
+
+SELECT count(*) = 1 AS stashed_advice_is_stored
+FROM sta.get_stash_contents('regress_stash');
+
+SELECT sta.get_stashed_advice(
+       sta.queryid('SELECT * FROM sta_regress.orders WHERE customer_id = 7'),
+       'regress_stash') = 'SEQ_SCAN(orders)' AS stashed_advice_is_retrievable;
+
+SELECT num_entries = 1 AS stash_list_reports_the_entries
+FROM sta.get_stashes() WHERE stash_name = 'regress_stash';
+
+-- 12.9 The stashed advice is used to plan the statement, and the planner
+-- is restored afterwards.
+SELECT e.advice = 'SEQ_SCAN(orders)' AS stashed_advice_is_applied
+FROM sta.explain_with_stashed_advice('regress_stash',
+       sta.queryid('SELECT * FROM sta_regress.orders WHERE customer_id = 7'),
+       'SELECT * FROM sta_regress.orders WHERE customer_id = 7', false) e;
+
+SELECT current_setting('enable_indexscan') = 'on' AS stash_restores_the_planner;
+
+-- 12.10 A null advice removes the entry, dropping the stash removes it all.
+SELECT sta.set_stashed_advice('regress_stash',
+       sta.queryid('SELECT * FROM sta_regress.orders WHERE customer_id = 7'),
+       NULL) IS NOT NULL AS null_advice_removes_the_entry;
+
+SELECT count(*) = 0 AS removed_entry_is_gone
+FROM sta.get_stash_contents('regress_stash');
+
+SELECT sta.drop_stash('regress_stash') IS NOT NULL AS drop_stash_ok;
+SELECT count(*) = 0 AS dropped_stash_is_gone
+FROM sta.get_stash_contents('regress_stash');
+
+SELECT count(*) = 0 AS dropped_stash_is_gone_from_the_list
+FROM sta.get_stashes() WHERE stash_name = 'regress_stash';
+
+-- 12.11 The tag catalogue is complete.
+SELECT count(*) = 0 AS every_enforceable_tag_has_a_setting
+FROM sta.plan_advice_tag t
+WHERE t.enforcement <> 'unsupported'
+  AND NOT EXISTS (SELECT 1 FROM sta.plan_advice_guc g WHERE g.tag = t.tag);
+
+------------------------------------------------------------------------------
+-- 13. Cleanup
 ------------------------------------------------------------------------------
 RESET search_path;
 DROP SCHEMA sta_regress CASCADE;

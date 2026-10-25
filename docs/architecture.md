@@ -49,6 +49,13 @@ Component design, data model, and the design decisions behind them.
                     │  recommendations()  validate()            │
                     │  snapshot_diff()    record_run()          │
                     │  advice_catalog()   validation_steps()    │
+                    │                                           │
+                    │  PostgreSQL 19 parity layer               │
+                    │  plan_advice_tag    plan_advice_guc       │
+                    │  advice_stash       advice_stash_entry    │
+                    │  plan_advice_string()  apply_advice()     │
+                    │  restore_advice()      create_stash()     │
+                    │  set_stashed_advice()  get_stash_contents()│
                     └────────────────────┬──────────────────────┘
                                          │
                           (C ABI)        │
@@ -393,6 +400,9 @@ extension's own namespace.
 | `sta.collect()` requires `pg_stat_statements` for workload data | Without it, only the plan and statistics sources work |
 | The ranking weights are **not** operator-tunable | Only the decision thresholds are |
 | `sta.table_stats_sample` and `sta.index_sample` are written but not read by the advice functions | The snapshots exist for future before/after comparisons; today the statistics advice reads the live catalogs |
+| Plan advice is enforced through **session-wide planner settings** | PostgreSQL 17 has no planner hook, so `SEQ_SCAN(d1)` means "no index scan for this statement", not "sequential scan of `d1` only". The advice that `pg_sta` generates still reproduces the plan it was generated from |
+| The advice stash has **no background worker** | PostgreSQL 19 can apply a stash to every matching query automatically; `pg_sta` applies it on demand, through `sta.explain_with_stashed_advice()` or `sta.apply_advice()` |
+| An advice target with an `@qualifier` is **not acted on** | The qualifier identifies a partition or a sub-plan; PostgreSQL 17 cannot address one through a planner setting. The qualifier is parsed and preserved, but it has no effect |
 
 ---
 
@@ -400,7 +410,8 @@ extension's own namespace.
 
 | Idea | Notes |
 |---|---|
-| PostgreSQL 19 parity | The advisory layer is version independent; only the C core needs the PG19 jumble/EXPLAIN changes |
+| PostgreSQL 19 parity | The advisory layer is version independent; only the C core needs the PG19 jumble/EXPLAIN changes. The plan-advice and advice-stash surfaces already exist — see [pg19-compatibility.md](pg19-compatibility.md) |
+| A background worker for the advice stash | Would close the last functional gap to PostgreSQL 19's `pg_stash_advice` |
 | Workload-wide index ranking | Rank candidates by how many statements in the window they would help |
 | `pg_sta--1.0.sql` upgrade path | The current extension has no upgrade script; it needs one before a version bump |
 | Reading the snapshot tables in the advice functions | This is what would make the before/after comparison a first-class feature |

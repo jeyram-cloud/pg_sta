@@ -511,6 +511,375 @@ END
 $$;
 
 -- -------------------------------------------------------------------------
+-- 8. PostgreSQL 19 plan advice
+-- -------------------------------------------------------------------------
+--
+-- The plan-advice feature is the pg_plan_advice equivalent of PostgreSQL
+-- 19: an advice string is generated from a plan, the advice string is
+-- parsed back into planner settings, and applying those settings must
+-- reproduce the plan the advice was generated from.
+--
+DO $$
+DECLARE
+    v_advice  text;
+    v_parsed  text[];
+    v_applied text[];
+    v_restored text[];
+    v_before  text;
+    v_during  text;
+    v_after   text;
+    v_plan_a  jsonb;
+    v_plan_b  jsonb;
+    v_cnt     int;
+    v_tag     text;
+    v_targets text[];
+    v_msg     text;
+BEGIN
+    -- ---- parsing -------------------------------------------------------
+    -- An advice string is split into its individual items.
+    v_parsed := sta._advice_split('SEQ_SCAN(foo) HASH_JOIN(bar@ss)');
+    INSERT INTO qa_result VALUES (default, 'advice: the splitter returns every item of an advice string',
+                                  '2', array_length(v_parsed, 1)::text,
+                                  array_length(v_parsed, 1) = 2);
+
+    -- A tag without a target list is a valid item.
+    v_parsed := sta._advice_split('NO_GATHER');
+    INSERT INTO qa_result VALUES (default, 'advice: a tag without a target list is accepted',
+                                  '1', array_length(v_parsed, 1)::text,
+                                  array_length(v_parsed, 1) = 1);
+
+    -- Tags are case insensitive and returned in upper case.
+    SELECT tag, targets INTO v_tag, v_targets
+      FROM sta._advice_parse('join_order(f d1 d2)') LIMIT 1;
+    INSERT INTO qa_result VALUES (default, 'advice: tags are case insensitive',
+                                  'JOIN_ORDER', v_tag, v_tag = 'JOIN_ORDER');
+
+    INSERT INTO qa_result VALUES (default, 'advice: the target list is parsed',
+                                  'f,d1,d2', array_to_string(v_targets, ','),
+                                  array_to_string(v_targets, ',') = 'f,d1,d2');
+
+    -- The advice language of PostgreSQL 19 uses @ to qualify a target.
+    SELECT targets INTO v_targets
+      FROM sta._advice_parse('HASH_JOIN(bar@ss)') LIMIT 1;
+    INSERT INTO qa_result VALUES (default, 'advice: a qualified target is parsed',
+                                  'bar@ss', array_to_string(v_targets, ','),
+                                  array_to_string(v_targets, ',') = 'bar@ss');
+
+    -- ---- generating advice from a plan ---------------------------------
+    v_advice := sta.plan_advice_string(
+        'SELECT * FROM sta_qa.pa_fact f
+           LEFT JOIN sta_qa.pa_dim1 d1 ON f.dim1_id = d1.id
+          WHERE d1.val1 = 1');
+
+    INSERT INTO qa_result VALUES (default, 'advice: a plan produces an advice string',
+                                  'non-empty', coalesce(length(v_advice)::text, 'null'),
+                                  v_advice IS NOT NULL AND v_advice <> '');
+
+    -- The generated advice must be parsable by the parser of the advisor.
+    SELECT count(*) INTO v_cnt
+      FROM sta._advice_parse(v_advice) p
+     WHERE p.tag NOT IN (SELECT tag FROM sta.plan_advice_tag);
+    INSERT INTO qa_result VALUES (default, 'advice: the generated advice only uses known tags',
+                                  '0', v_cnt::text, v_cnt = 0);
+
+    -- ---- round trip -----------------------------------------------------
+    -- The central guarantee of the feature: the advice generated from a
+    -- plan must reproduce that very plan when it is applied.
+    SELECT sta.explain(
+        'SELECT * FROM sta_qa.pa_fact f
+           LEFT JOIN sta_qa.pa_dim1 d1 ON f.dim1_id = d1.id
+          WHERE d1.val1 = 1', false)
+      INTO v_plan_a;
+
+    SELECT (sta.run_with_advice(v_advice,
+        'SELECT * FROM sta_qa.pa_fact f
+           LEFT JOIN sta_qa.pa_dim1 d1 ON f.dim1_id = d1.id
+          WHERE d1.val1 = 1', false)->0->'Plan')
+      INTO v_plan_b;
+
+    INSERT INTO qa_result VALUES (default, 'advice: applying the generated advice reproduces the plan',
+                                  'identical',
+                                  CASE WHEN v_plan_a->0->'Plan' = v_plan_b THEN 'identical' ELSE 'different' END,
+                                  v_plan_a->0->'Plan' = v_plan_b);
+
+    -- ---- applying and restoring ----------------------------------------
+    v_before := current_setting('enable_indexscan');
+
+    v_applied := sta.apply_advice('SEQ_SCAN(d1)');
+
+    -- SEQ_SCAN does not switch enable_seqscan off; it switches the index
+    -- scan methods off, so that only the sequential scan is left.
+    v_during := current_setting('enable_indexscan');
+    INSERT INTO qa_result VALUES (default, 'advice: applying SEQ_SCAN disables the index scans',
+                                  'off', v_during, v_during = 'off');
+
+    v_restored := sta.restore_advice();
+    v_after := current_setting('enable_indexscan');
+    INSERT INTO qa_result VALUES (default, 'advice: restoring returns the previous setting',
+                                  v_before, v_after, v_after = v_before);
+
+    -- The restore list must name the settings that were changed.
+    INSERT INTO qa_result VALUES (default, 'advice: the restore list names the changed settings',
+                                  '3', array_length(v_restored, 1)::text,
+                                  array_length(v_restored, 1) = 3);
+
+    -- Applying a second time must first restore the baseline, so that the
+    -- restore list is still exact.
+    v_applied := sta.apply_advice('SEQ_SCAN(d1)');
+    v_restored := sta.restore_advice();
+    v_after := current_setting('enable_indexscan');
+    INSERT INTO qa_result VALUES (default, 'advice: applying twice still restores the baseline',
+                                  v_before, v_after, v_after = v_before);
+
+    -- Two advice items that touch the same planner setting must not
+    -- confuse the recorded baseline: the value that was in force before the
+    -- first item was applied is the one that has to be restored.
+    v_applied := sta.apply_advice('SEQ_SCAN(d1) SEQ_SCAN(d2)');
+    v_during := current_setting('enable_indexscan');
+    INSERT INTO qa_result VALUES (default, 'advice: a repeated tag still switches the planner',
+                                  'off', v_during, v_during = 'off');
+
+    v_restored := sta.restore_advice();
+    v_after := current_setting('enable_indexscan');
+    INSERT INTO qa_result VALUES (default, 'advice: a repeated tag restores the original setting',
+                                  v_before, v_after, v_after = v_before);
+
+    -- An unsupported tag must be reported as such instead of silently
+    -- doing nothing.
+    v_applied := sta.apply_advice('JOIN_ORDER(f d1)');
+    INSERT INTO qa_result VALUES (default, 'advice: an unsupported tag is reported as unsupported',
+                                  'JOIN_ORDER:unsupported',
+                                  coalesce(array_to_string(v_applied, ','), ''),
+                                  v_applied = ARRAY['JOIN_ORDER:unsupported']::text[]);
+
+    -- The unsupported tag must not have changed anything, so the restore
+    -- list is empty.
+    v_restored := sta.restore_advice();
+    INSERT INTO qa_result VALUES (default, 'advice: an unsupported tag changes nothing',
+                                  '0', coalesce(array_length(v_restored, 1), 0)::text,
+                                  coalesce(array_length(v_restored, 1), 0) = 0);
+
+    -- An unknown tag must be an error.
+    BEGIN
+        PERFORM sta.apply_advice('BOGUS_TAG(x)');
+        v_msg := 'no error';
+    EXCEPTION WHEN OTHERS THEN
+        v_msg := SQLERRM;
+    END;
+    INSERT INTO qa_result VALUES (default, 'advice: an unknown tag raises an error',
+                                  'unknown plan advice tag', v_msg,
+                                  v_msg LIKE 'unknown plan advice tag%');
+
+    -- ---- the tag catalogue ---------------------------------------------
+    -- Every tag must either map to at least one planner setting or be
+    -- marked unsupported.  A tag that maps to nothing and is not marked
+    -- unsupported would silently do nothing.
+    SELECT count(*) INTO v_cnt
+      FROM sta.plan_advice_tag t
+     WHERE t.enforcement <> 'unsupported'
+       AND NOT EXISTS (SELECT 1 FROM sta.plan_advice_guc g WHERE g.tag = t.tag);
+    INSERT INTO qa_result VALUES (default, 'advice: every enforceable tag maps to a planner setting',
+                                  '0', v_cnt::text, v_cnt = 0);
+
+    -- The view of the catalogue must show every tag.
+    SELECT count(*) INTO v_cnt FROM sta.plan_advice_tag_view;
+    INSERT INTO qa_result VALUES (default, 'advice: the tag view lists every tag',
+                                  (SELECT count(*)::text FROM sta.plan_advice_tag),
+                                  v_cnt::text,
+                                  v_cnt = (SELECT count(*) FROM sta.plan_advice_tag));
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- 9. PostgreSQL 19 advice stash
+-- -------------------------------------------------------------------------
+--
+-- The stash is the pg_stash_advice equivalent of PostgreSQL 19: advice is
+-- stored per query id in a named container so that it can be applied
+-- later, without the caller having to repeat the advice string.
+--
+DO $$
+DECLARE
+    v_qid     bigint;
+    v_advice  text;
+    v_cnt     int;
+    v_msg     text;
+    v_entries bigint;
+BEGIN
+    v_qid := sta.queryid('SELECT * FROM sta_qa.pa_fact f
+                             LEFT JOIN sta_qa.pa_dim1 d1 ON f.dim1_id = d1.id
+                            WHERE d1.val1 = 1');
+
+    -- A fresh stash is empty.
+    PERFORM sta.create_stash('qa_stash');
+    SELECT count(*) INTO v_cnt FROM sta.get_stash_contents('qa_stash');
+    INSERT INTO qa_result VALUES (default, 'stash: a new stash is empty',
+                                  '0', v_cnt::text, v_cnt = 0);
+
+    -- Creating the same stash twice must be an error.
+    BEGIN
+        PERFORM sta.create_stash('qa_stash');
+        v_msg := 'no error';
+    EXCEPTION WHEN duplicate_object THEN
+        v_msg := 'duplicate';
+    END;
+    INSERT INTO qa_result VALUES (default, 'stash: creating an existing stash raises an error',
+                                  'duplicate', v_msg, v_msg = 'duplicate');
+
+    -- An invalid stash name must be rejected.
+    BEGIN
+        PERFORM sta.create_stash('99bottles');
+        v_msg := 'no error';
+    EXCEPTION WHEN invalid_parameter_value THEN
+        v_msg := 'invalid';
+    END;
+    INSERT INTO qa_result VALUES (default, 'stash: an invalid stash name raises an error',
+                                  'invalid', v_msg, v_msg = 'invalid');
+
+    -- Dropping a stash that does not exist must be an error.
+    BEGIN
+        PERFORM sta.drop_stash('no_such_stash');
+        v_msg := 'no error';
+    EXCEPTION WHEN undefined_object THEN
+        v_msg := 'undefined';
+    END;
+    INSERT INTO qa_result VALUES (default, 'stash: dropping an unknown stash raises an error',
+                                  'undefined', v_msg, v_msg = 'undefined');
+
+    -- Storing advice for a query id.
+    PERFORM sta.set_stashed_advice('qa_stash', v_qid, 'SEQ_SCAN(d1)');
+
+    SELECT count(*) INTO v_cnt FROM sta.get_stash_contents('qa_stash');
+    INSERT INTO qa_result VALUES (default, 'stash: the stored advice appears in the contents',
+                                  '1', v_cnt::text, v_cnt = 1);
+
+    -- The entry must be retrievable by query id.
+    v_advice := sta.get_stashed_advice(v_qid, 'qa_stash');
+    INSERT INTO qa_result VALUES (default, 'stash: the advice is retrievable by query id',
+                                  'SEQ_SCAN(d1)', coalesce(v_advice, 'null'),
+                                  v_advice = 'SEQ_SCAN(d1)');
+
+    -- The list of stashes must report the number of entries.
+    SELECT num_entries INTO v_entries FROM sta.get_stashes() WHERE stash_name = 'qa_stash';
+    INSERT INTO qa_result VALUES (default, 'stash: the stash list reports the number of entries',
+                                  '1', coalesce(v_entries::text, 'null'), v_entries = 1);
+
+    -- An unknown stash yields no rows instead of an error.
+    SELECT count(*) INTO v_cnt FROM sta.get_stash_contents('no_such_stash');
+    INSERT INTO qa_result VALUES (default, 'stash: the contents of an unknown stash are empty',
+                                  '0', v_cnt::text, v_cnt = 0);
+
+    -- The query id zero must be rejected.
+    BEGIN
+        PERFORM sta.set_stashed_advice('qa_stash', 0, 'SEQ_SCAN(d1)');
+        v_msg := 'no error';
+    EXCEPTION WHEN invalid_parameter_value THEN
+        v_msg := 'invalid';
+    END;
+    INSERT INTO qa_result VALUES (default, 'stash: the query id zero raises an error',
+                                  'invalid', v_msg, v_msg = 'invalid');
+
+    -- Storing advice for a query id that is not in the stash must be an
+    -- error.
+    BEGIN
+        PERFORM sta.set_stashed_advice('no_such_stash', v_qid, 'SEQ_SCAN(d1)');
+        v_msg := 'no error';
+    EXCEPTION WHEN undefined_object THEN
+        v_msg := 'undefined';
+    END;
+    INSERT INTO qa_result VALUES (default, 'stash: storing advice in an unknown stash raises an error',
+                                  'undefined', v_msg, v_msg = 'undefined');
+
+    -- Storing the same query id twice replaces the advice.
+    PERFORM sta.set_stashed_advice('qa_stash', v_qid, 'HASH_JOIN(d1)');
+    v_advice := sta.get_stashed_advice(v_qid, 'qa_stash');
+    INSERT INTO qa_result VALUES (default, 'stash: storing the same query id twice replaces the advice',
+                                  'HASH_JOIN(d1)', coalesce(v_advice, 'null'),
+                                  v_advice = 'HASH_JOIN(d1)');
+
+    -- A null advice removes the entry.
+    PERFORM sta.set_stashed_advice('qa_stash', v_qid, NULL);
+    SELECT count(*) INTO v_cnt FROM sta.get_stash_contents('qa_stash');
+    INSERT INTO qa_result VALUES (default, 'stash: a null advice removes the entry',
+                                  '0', v_cnt::text, v_cnt = 0);
+
+    -- The stash must not leak into another session: it is stored in an
+    -- ordinary table, so it is visible everywhere.  What must not happen is
+    -- that dropping the stash leaves its entries behind.
+    PERFORM sta.set_stashed_advice('qa_stash', v_qid, 'SEQ_SCAN(d1)');
+    PERFORM sta.drop_stash('qa_stash');
+    SELECT count(*) INTO v_cnt FROM sta.get_stash_contents('qa_stash');
+    INSERT INTO qa_result VALUES (default, 'stash: dropping a stash removes its entries',
+                                  '0', v_cnt::text, v_cnt = 0);
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- 10. Applying stashed advice
+-- -------------------------------------------------------------------------
+--
+-- The end-to-end path of the stash: a statement is planned with the advice
+-- that is stored for its query id, and the planner settings are restored
+-- afterwards.
+--
+DO $$
+DECLARE
+    v_qid     bigint;
+    v_before  text;
+    v_after   text;
+    v_advice  text;
+    v_applied text[];
+    v_plan    jsonb;
+    v_cnt     int;
+BEGIN
+    v_qid := sta.queryid('SELECT * FROM sta_qa.pa_fact f
+                             LEFT JOIN sta_qa.pa_dim1 d1 ON f.dim1_id = d1.id
+                            WHERE d1.val1 = 1');
+
+    PERFORM sta.create_stash('qa_apply');
+    PERFORM sta.set_stashed_advice('qa_apply', v_qid, 'SEQ_SCAN(d1)');
+
+    v_before := current_setting('enable_seqscan');
+
+    SELECT e.advice, e.applied, e.plan
+      INTO v_advice, v_applied, v_plan
+      FROM sta.explain_with_stashed_advice('qa_apply', v_qid,
+        'SELECT * FROM sta_qa.pa_fact f
+           LEFT JOIN sta_qa.pa_dim1 d1 ON f.dim1_id = d1.id
+          WHERE d1.val1 = 1', false) e;
+
+    INSERT INTO qa_result VALUES (default, 'stash: the stored advice is used to plan the statement',
+                                  'SEQ_SCAN(d1)', coalesce(v_advice, 'null'),
+                                  v_advice = 'SEQ_SCAN(d1)');
+
+    INSERT INTO qa_result VALUES (default, 'stash: the stashed advice is applied to the planner',
+                                  '3', coalesce(array_length(v_applied, 1), 0)::text,
+                                  array_length(v_applied, 1) = 3);
+
+    INSERT INTO qa_result VALUES (default, 'stash: the statement is planned',
+                                  'plan', coalesce(v_plan->0->'Plan'->>'Node Type', 'null'),
+                                  v_plan IS NOT NULL AND v_plan->0->'Plan' IS NOT NULL);
+
+    v_after := current_setting('enable_seqscan');
+    INSERT INTO qa_result VALUES (default, 'stash: the planner settings are restored afterwards',
+                                  v_before, v_after, v_after = v_before);
+
+    -- A query id that is not in the stash is planned normally.
+    SELECT e.applied INTO v_applied
+      FROM sta.explain_with_stashed_advice('qa_apply', 42,
+        'SELECT * FROM sta_qa.pa_fact f
+           LEFT JOIN sta_qa.pa_dim1 d1 ON f.dim1_id = d1.id
+          WHERE d1.val1 = 1', false) e;
+
+    INSERT INTO qa_result VALUES (default, 'stash: a query id that is not stashed changes nothing',
+                                  '0', coalesce(array_length(v_applied, 1), 0)::text,
+                                  coalesce(array_length(v_applied, 1), 0) = 0);
+
+    PERFORM sta.drop_stash('qa_apply');
+END
+$$;
+
+-- -------------------------------------------------------------------------
 -- Final report
 -- -------------------------------------------------------------------------
 -- Emitted unaligned with '|' as the separator so that test/run_qa.sh can

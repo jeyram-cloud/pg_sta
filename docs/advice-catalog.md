@@ -393,6 +393,43 @@ the table before acting.
 
 ---
 
+## 3c. Plan advice tags
+
+The plan-advice feature has its own, separate catalogue: the *advice
+tags*. A tag is not a finding — it is an instruction that tells the
+planner how a statement should be planned. The catalogue is data:
+
+```sql
+SELECT * FROM sta.plan_advice_tag_view;
+```
+
+| Tag | Category | Enforcement | Planner settings |
+|---|---|---|---|
+| `SEQ_SCAN` | scan | approximate | `enable_indexscan=off`, `enable_indexonlyscan=off`, `enable_bitmapscan=off` |
+| `INDEX_SCAN` | scan | approximate | `enable_seqscan=off`, `enable_bitmapscan=off` |
+| `INDEX_ONLY_SCAN` | scan | approximate | `enable_seqscan=off`, `enable_bitmapscan=off`, `enable_indexscan=off` |
+| `BITMAP_HEAP_SCAN` | scan | approximate | `enable_seqscan=off`, `enable_indexscan=off`, `enable_indexonlyscan=off` |
+| `NESTED_LOOP_PLAIN` | join | approximate | `enable_hashjoin=off`, `enable_mergejoin=off` |
+| `HASH_JOIN` | join | approximate | `enable_nestloop=off`, `enable_mergejoin=off` |
+| `MERGE_JOIN` | join | approximate | `enable_nestloop=off`, `enable_hashjoin=off` |
+| `PARTITIONWISE` | partition | approximate | `enable_partitionwise_join=on`, `enable_partitionwise_aggregate=on` |
+| `NO_GATHER` | parallel | approximate | `max_parallel_workers_per_gather=0` |
+| `DO_NOT_SCAN` | scan | unsupported | — |
+| `JOIN_ORDER` | join | unsupported | — |
+| `SEMIJOIN_UNIQUE` | join | unsupported | — |
+| `SEMIJOIN_NON_UNIQUE` | join | unsupported | — |
+| `GATHER` | parallel | unsupported | — |
+| `GATHER_MERGE` | parallel | unsupported | — |
+
+`exact` enforcement would mean that the tag can be applied to a single
+relation without affecting the rest of the statement. That needs a
+planner hook, which PostgreSQL 17 does not have. Every tag is therefore
+`approximate` on PostgreSQL 17, and the six tags that have no planner
+setting at all are `unsupported` — they are reported as
+`TAG:unsupported` rather than silently ignored.
+
+The full analysis is in [pg19-compatibility.md](pg19-compatibility.md).
+
 ## 3b. Snapshot findings
 
 `sta.snapshot_diff()` compares the two most recent snapshots of a schema

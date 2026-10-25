@@ -32,6 +32,15 @@
 #   validate DDL SQL         measure a proposed index against the current plan
 #   queryid SQL              the canonical query id of a statement
 #   explain SQL              the execution plan of a statement
+#   plan-advice SQL          PostgreSQL 19 style plan advice for one statement
+#   advice ADVICE SQL        plan one statement with an advice string applied
+#   stash list               list the advice stashes
+#   stash create NAME        create an advice stash
+#   stash drop NAME          drop an advice stash
+#   stash show [NAME]        show the contents of an advice stash
+#   stash set NAME QID ADVICE
+#                            store advice for a query id in a stash
+#   stash remove NAME QID    remove the advice stored for a query id
 #   catalog                  the catalogue of all findings the advisor knows
 #   server-info              version and configuration of the server
 #   record SCOPE [TARGET]    record an advisory run in the audit trail
@@ -50,6 +59,11 @@
 #   pg_sta_ctl --database appdb validate \
 #       "CREATE INDEX idx_orders_customer ON orders (customer_id)" \
 #       "SELECT * FROM orders WHERE customer_id = 42"
+#   pg_sta_ctl --database appdb plan-advice "SELECT * FROM orders WHERE customer_id = 42"
+#   pg_sta_ctl --database appdb advice "SEQ_SCAN(orders)" "SELECT * FROM orders WHERE customer_id = 42"
+#   pg_sta_ctl --database appdb stash create nightly
+#   pg_sta_ctl --database appdb stash set nightly 1234567890 "SEQ_SCAN(orders)"
+#   pg_sta_ctl --database appdb stash show nightly
 #
 set -euo pipefail
 
@@ -73,11 +87,15 @@ DDL_ARG=""
 SCHEMA_ARG=""
 SCOPE_ARG=""
 TARGET_ARG=""
+ADVICE_ARG=""
+STASH_CMD=""
+STASH_NAME=""
+QID_ARG=""
 
 die() { echo "pg_sta_ctl: $*" >&2; exit 1; }
 
 usage() {
-    sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --------------------------------------------------------------------------
@@ -104,12 +122,33 @@ done
 COMMAND="$1"; shift
 
 case "$COMMAND" in
-    plan|index|queryid|explain)
+    plan|index|queryid|explain|plan-advice)
         [ $# -ge 1 ] || die "$COMMAND needs a SQL statement"
         SQL_ARG="$1"; shift ;;
+    advice)
+        [ $# -ge 2 ] || die "advice needs an advice string and a SQL statement"
+        ADVICE_ARG="$1"; SQL_ARG="$2"; shift 2 ;;
     validate)
         [ $# -ge 2 ] || die "validate needs an index DDL and a SQL statement"
         DDL_ARG="$1"; SQL_ARG="$2"; shift 2 ;;
+    stash)
+        [ $# -ge 1 ] || die "stash needs a subcommand (list, create, drop, show, set, remove)"
+        STASH_CMD="$1"; shift
+        case "$STASH_CMD" in
+            list) ;;
+            create|drop)
+                [ $# -ge 1 ] || die "stash $STASH_CMD needs a stash name"
+                STASH_NAME="$1"; shift ;;
+            show)
+                if [ $# -ge 1 ]; then STASH_NAME="$1"; shift; fi ;;
+            set)
+                [ $# -ge 3 ] || die "stash set needs a stash name, a query id and an advice string"
+                STASH_NAME="$1"; QID_ARG="$2"; ADVICE_ARG="$3"; shift 3 ;;
+            remove)
+                [ $# -ge 2 ] || die "stash remove needs a stash name and a query id"
+                STASH_NAME="$1"; QID_ARG="$2"; shift 2 ;;
+            *) die "unknown stash subcommand: $STASH_CMD" ;;
+        esac ;;
     stats|diff)
         if [ $# -ge 1 ]; then SCHEMA_ARG="$1"; shift; fi ;;
     report)
@@ -392,6 +431,68 @@ explain)
     cat <<SQL | run_sql "-q -A -t"
 SELECT jsonb_pretty(sta.explain($(sql_literal "$SQL_ARG"), $ANALYZE));
 SQL
+    ;;
+
+plan-advice)
+    cat <<SQL | run_sql "-q -A -t"
+SELECT 'advice:        ' || coalesce(sta.plan_advice_string($(sql_literal "$SQL_ARG"), $ANALYZE), '(none)') || E'\n' ||
+       'advice items:  ' || coalesce(array_to_string(sta._advice_split(sta.plan_advice_string($(sql_literal "$SQL_ARG"), $ANALYZE)), ', '), '(none)') || E'\n' ||
+       'query id:      ' || sta.queryid($(sql_literal "$SQL_ARG"))
+SQL
+    ;;
+
+advice)
+    cat <<SQL | run_sql "-q -A -t"
+SELECT 'advice:       ' || $(sql_literal "$ADVICE_ARG") || E'\n' ||
+       'applied:      ' || coalesce(array_to_string(e.applied, ', '), '(none)') || E'\n' ||
+       'restored:     ' || coalesce(array_to_string(e.restored, ', '), '(none)') || E'\n' ||
+       'top node:     ' || coalesce(e.plan->0->'Plan'->>'Node Type', '-') || E'\n' ||
+       'plan:         ' || jsonb_pretty(e.plan)
+FROM sta.explain_with_advice($(sql_literal "$ADVICE_ARG"), $(sql_literal "$SQL_ARG"), $ANALYZE) e;
+SQL
+    ;;
+
+stash)
+    case "$STASH_CMD" in
+        list)
+            cat <<SQL | run_sql "-q"
+SELECT stash_name, num_entries FROM sta.get_stashes() ORDER BY stash_name;
+SQL
+            ;;
+        create)
+            cat <<SQL | run_sql "-q -A -t"
+DO \$pg_sta_do\$ BEGIN PERFORM sta.create_stash($(sql_literal "$STASH_NAME")); END \$pg_sta_do\$;
+SELECT 'created stash ' || $(sql_literal "$STASH_NAME") || E'\n' ||
+       'stashes now: ' || coalesce((SELECT string_agg(s.stash_name, ', ' ORDER BY s.stash_name) FROM sta.get_stashes() s), '(none)');
+SQL
+            ;;
+        drop)
+            cat <<SQL | run_sql "-q -A -t"
+DO \$pg_sta_do\$ BEGIN PERFORM sta.drop_stash($(sql_literal "$STASH_NAME")); END \$pg_sta_do\$;
+SELECT 'dropped stash ' || $(sql_literal "$STASH_NAME") || E'\n' ||
+       'stashes now: ' || coalesce((SELECT string_agg(s.stash_name, ', ' ORDER BY s.stash_name) FROM sta.get_stashes() s), '(none)');
+SQL
+            ;;
+        show)
+            cat <<SQL | run_sql "-q"
+SELECT stash_name, query_id, advice_string FROM sta.get_stash_contents($(sql_literal "$STASH_NAME")) ORDER BY stash_name, query_id;
+SQL
+            ;;
+        set)
+            cat <<SQL | run_sql "-q -A -t"
+DO \$pg_sta_do\$ BEGIN PERFORM sta.set_stashed_advice($(sql_literal "$STASH_NAME"), $QID_ARG::bigint, $(sql_literal "$ADVICE_ARG")); END \$pg_sta_do\$;
+SELECT 'stored advice for query id ' || $QID_ARG || ' in stash ' || $(sql_literal "$STASH_NAME") || E'\n' ||
+       'entries now: ' || (SELECT s.num_entries FROM sta.get_stashes() s WHERE s.stash_name = $(sql_literal "$STASH_NAME"));
+SQL
+            ;;
+        remove)
+            cat <<SQL | run_sql "-q -A -t"
+DO \$pg_sta_do\$ BEGIN PERFORM sta.set_stashed_advice($(sql_literal "$STASH_NAME"), $QID_ARG::bigint, NULL); END \$pg_sta_do\$;
+SELECT 'removed advice for query id ' || $QID_ARG || ' from stash ' || $(sql_literal "$STASH_NAME") || E'\n' ||
+       'entries now: ' || (SELECT s.num_entries FROM sta.get_stashes() s WHERE s.stash_name = $(sql_literal "$STASH_NAME"));
+SQL
+            ;;
+    esac
     ;;
 
 catalog)
