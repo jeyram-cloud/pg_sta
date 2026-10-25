@@ -55,6 +55,13 @@ cannot be validated is not a recommendation.
 ## Quick start
 
 ```bash
+# 0. run every command from the directory that holds the pg_sta source
+#    tree -- this is where the Makefile lives.  A Makefile is NOT in
+#    /var/lib/pgsql or in /usr/pgsql-17/bin, so `make` there fails with
+#    "No targets specified and no makefile found".
+cd /home/vagrant/pg_sta        # the VM; on a normal host it is wherever
+                               # you unpacked the repository
+
 # 1. build and install into your PostgreSQL 17 tree
 make PG_CONFIG=/usr/pgsql-17/bin/pg_config
 sudo make PG_CONFIG=/usr/pgsql-17/bin/pg_config install

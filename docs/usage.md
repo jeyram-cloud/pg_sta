@@ -81,8 +81,15 @@ The extension uses standard PGXS, so the normal PostgreSQL build machinery
 is enough:
 
 ```bash
+cd /path/to/pg_sta            # the directory that holds the Makefile
 make PG_CONFIG=/usr/pgsql-17/bin/pg_config
 ```
+
+> **Run `make` from the source directory.** PGXS reads the `Makefile` in
+> the current directory, so `make` in `/var/lib/pgsql`, in
+> `/usr/pgsql-17/bin` or in `$HOME` fails with
+> `make: *** No targets specified and no makefile found.` — that message
+> means "wrong directory", not "broken build".
 
 Artefacts land in `src/pg_sta.so` and the SQL script stays in `sql/`.
 
@@ -94,6 +101,7 @@ command works — PGXS does not need a live cluster.
 ### Build inside the container/VM
 
 ```bash
+cd /home/vagrant/pg_sta        # where the tree was copied to
 sudo make PG_CONFIG=/usr/pgsql-17/bin/pg_config install
 ```
 

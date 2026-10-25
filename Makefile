@@ -1,5 +1,9 @@
 # pg_sta -- PostgreSQL SQL Tuning Advisor
 #
+# Run every make command from the directory that holds this Makefile (the
+# pg_sta source tree).  "No targets specified and no makefile found" means
+# the current directory is not the source tree.
+#
 # Build:   make PG_CONFIG=/usr/pgsql-17/bin/pg_config
 # Install: make install PG_CONFIG=/usr/pgsql-17/bin/pg_config
 # Test:    make installcheck PG_CONFIG=/usr/pgsql-17/bin/pg_config
