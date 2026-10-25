@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+#
+# pg_sta_ctl -- command line interface for the pg_sta SQL Tuning Advisor.
+#
+# pg_sta is an open-source PostgreSQL 17 SQL Tuning Advisor: it analyses the
+# workload, the execution plans and the table statistics of a database and
+# returns explainable, ranked tuning recommendations with the evidence that
+# produced them.
+#
+# Connection
+# ----------
+# Two modes are supported:
+#
+#   --local   use the local psql client and the standard PG* environment
+#             variables (PGHOST, PGPORT, PGUSER, PGDATABASE, PGPASSWORD)
+#   --ssh     (default) run psql as the postgres user on the development VM
+#             over SSH, using PG_STA_HOST / PG_STA_SSH_PORT / PG_STA_SSH_KEY
+#
+# Usage
+# -----
+#   pg_sta_ctl [--database DB] [--output text|markdown|json] <command> [args]
+#
+# Commands
+# --------
+#   collect                  capture a workload snapshot (sta.collect)
+#   reset                    discard the collected snapshots (sta.reset)
+#   report [--sql SQL]       all findings, ranked by impact
+#   workload                 findings about the captured workload
+#   plan SQL                 findings about the plan of one statement
+#   stats [SCHEMA]           findings about the statistics of the tables
+#   index SQL                index candidates for one statement
+#   validate DDL SQL         measure a proposed index against the current plan
+#   queryid SQL              the canonical query id of a statement
+#   explain SQL              the execution plan of a statement
+#   catalog                  the catalogue of all findings the advisor knows
+#   server-info              version and configuration of the server
+#   record SCOPE [TARGET]    record an advisory run in the audit trail
+#   diff [SCHEMA]            compare the two most recent snapshots of a schema
+#   install                  build and install the extension on the VM
+#   regress                  run the regression suite
+#   qa                       run the QA suite
+#
+# Examples
+# --------
+#   pg_sta_ctl --database appdb collect
+#   pg_sta_ctl --database appdb report
+#   pg_sta_ctl --database appdb --output json report > findings.json
+#   pg_sta_ctl --database appdb plan "SELECT * FROM orders WHERE customer_id = 42"
+#   pg_sta_ctl --database appdb index "SELECT * FROM orders WHERE customer_id = 42"
+#   pg_sta_ctl --database appdb validate \
+#       "CREATE INDEX idx_orders_customer ON orders (customer_id)" \
+#       "SELECT * FROM orders WHERE customer_id = 42"
+#
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd "$HERE/.." && pwd)
+
+PG_STA_HOST=${PG_STA_HOST:-127.0.0.1}
+PG_STA_SSH_PORT=${PG_STA_SSH_PORT:-2201}
+PG_STA_SSH_KEY=${PG_STA_SSH_KEY:-$HOME/.vagrant.d/insecure_private_key}
+PG_STA_PGDATABASE=${PG_STA_PGDATABASE:-postgres}
+
+DB="$PG_STA_PGDATABASE"
+MODE=ssh
+OUTPUT=text
+LIMIT=50
+WINDOW=window
+ITERATIONS=3
+ANALYZE=false
+SQL_ARG=""
+DDL_ARG=""
+SCHEMA_ARG=""
+SCOPE_ARG=""
+TARGET_ARG=""
+
+die() { echo "pg_sta_ctl: $*" >&2; exit 1; }
+
+usage() {
+    sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# --------------------------------------------------------------------------
+# Options
+# --------------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d|--database) DB="$2"; shift 2 ;;
+        --local)       MODE=local; shift ;;
+        --ssh)         MODE=ssh; shift ;;
+        -o|--output)   OUTPUT="$2"; shift 2 ;;
+        --limit)       LIMIT="$2"; shift 2 ;;
+        --window)      WINDOW="$2"; shift 2 ;;
+        --iterations)  ITERATIONS="$2"; shift 2 ;;
+        --analyze)     ANALYZE=true; shift ;;
+        -h|--help)     usage; exit 0 ;;
+        --)            shift; break ;;
+        -*)            die "unknown option: $1" ;;
+        *)             break ;;
+    esac
+done
+
+[ $# -ge 1 ] || { usage; exit 1; }
+COMMAND="$1"; shift
+
+case "$COMMAND" in
+    plan|index|queryid|explain)
+        [ $# -ge 1 ] || die "$COMMAND needs a SQL statement"
+        SQL_ARG="$1"; shift ;;
+    validate)
+        [ $# -ge 2 ] || die "validate needs an index DDL and a SQL statement"
+        DDL_ARG="$1"; SQL_ARG="$2"; shift 2 ;;
+    stats|diff)
+        if [ $# -ge 1 ]; then SCHEMA_ARG="$1"; shift; fi ;;
+    report)
+        if [ $# -ge 1 ]; then
+            [ "$1" = "--sql" ] && shift
+            SQL_ARG="$1"; shift
+        fi ;;
+    record)
+        if [ $# -ge 1 ]; then SCOPE_ARG="$1"; shift; fi
+        if [ $# -ge 1 ]; then TARGET_ARG="$1"; shift; fi ;;
+    collect|reset|workload|catalog|server-info|install|regress|qa) ;;
+    *) die "unknown command: $COMMAND" ;;
+esac
+
+case "$OUTPUT" in
+    text|markdown|json) ;;
+    *) die "unknown output format: $OUTPUT (use text, markdown or json)" ;;
+esac
+
+# --------------------------------------------------------------------------
+# SQL helpers
+# --------------------------------------------------------------------------
+
+# Wrap a user supplied string as a dollar quoted SQL literal.  The tag is
+# derived from the content and extended until it cannot occur in the string,
+# so any SQL statement -- including one that contains dollar quotes itself --
+# can be embedded safely.
+sql_literal() {
+    local s=$1 tag
+    tag="\$pg_sta_$(printf '%s' "$s" | cksum | cut -d' ' -f1)\$"
+    while [ "${s#*"$tag"}" != "$s" ]; do tag="${tag}_x"; done
+    printf '%s%s%s' "$tag" "$s" "$tag"
+}
+
+# Run the SQL read from stdin and return the result on stdout.
+#   $1 = extra psql flags (space separated)
+run_sql() {
+    local flags="$1"
+    local tmp
+    tmp=$(mktemp)
+    cat > "$tmp"
+
+    if [ "$MODE" = "local" ]; then
+        # shellcheck disable=SC2086
+        psql -X -v ON_ERROR_STOP=1 $flags -d "$DB" < "$tmp"
+        rm -f "$tmp"
+    else
+        ssh -i "$PG_STA_SSH_KEY" -p "$PG_STA_SSH_PORT" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "vagrant@$PG_STA_HOST" \
+            "sudo -u postgres psql -X -v ON_ERROR_STOP=1 $flags -d '$DB'" < "$tmp"
+        rm -f "$tmp"
+    fi
+}
+
+# The common projection of the three advice functions.  Every list oriented
+# command is rendered from this shape, so the text, markdown and json output
+# always describe the same fields.
+project_advice() {
+    # $1 = the SQL expression that produces the "subject" of the finding
+    #      (the relation for plan/statistics findings, the statement text
+    #       for workload findings).
+    cat <<SQL
+SELECT finding_id::int                        AS id,
+       severity,
+       category,
+       $1                                      AS subject,
+       finding,
+       finding_text                           AS detail,
+       recommendation,
+       expected_benefit                       AS benefit,
+       estimated_cost                         AS cost,
+       validation_steps                       AS steps,
+       confidence
+SQL
+}
+
+# advice_text <base query>
+#
+# Renders the findings of the base query as an indented, human readable
+# block.  This is the format a DBA reads: every finding states what was
+# observed, what to do, what it should buy, what it costs and how to check
+# it.
+advice_text() {
+    local base="$1"
+    cat <<SQL
+WITH r AS (
+$base
+), s AS (
+    SELECT *, array_to_string(steps, E'\n              ') AS steps_text
+    FROM r
+)
+SELECT 'pg_sta: ' || count(*) || ' finding(s)' || E'\n\n' ||
+       coalesce(string_agg(
+           '[' || severity || '] ' || category || ' / ' || finding ||
+           CASE WHEN confidence IS NOT NULL AND confidence <> ''
+                THEN '  (confidence: ' || confidence || ')' ELSE '' END ||
+           E'\n' ||
+           '  subject:   ' || coalesce(nullif(subject, ''), '-') || E'\n' ||
+           '  observed:  ' || coalesce(nullif(detail, ''), '-') || E'\n' ||
+           '  advice:    ' || coalesce(nullif(recommendation, ''), '-') || E'\n' ||
+           '  benefit:   ' || coalesce(nullif(benefit, ''), '-') || E'\n' ||
+           '  cost:      ' || coalesce(nullif(cost, ''), '-') || E'\n' ||
+           '  validate:  ' || coalesce(nullif(steps_text, ''), '-'),
+           E'\n\n' ORDER BY id), '')
+FROM s;
+SQL
+}
+
+# advice_markdown <base query>
+advice_markdown() {
+    local base="$1"
+    cat <<SQL
+WITH r AS (
+$base
+), s AS (
+    SELECT *, coalesce(array_to_string(steps, ' / '), '-') AS steps_text
+    FROM r
+)
+SELECT coalesce(
+    '| # | Severity | Category | Subject | Finding | Advice | Expected benefit | Estimated cost | Validation steps |' || E'\n' ||
+    '|---|---|---|---|---|---|---|---|---|' || E'\n' ||
+    string_agg(
+        '| ' || id || ' | ' || severity || ' | ' || category || ' | ' ||
+        replace(coalesce(nullif(subject, ''), '-'), '|', '/') || ' | ' ||
+        replace(finding, '|', '/') || ' | ' ||
+        replace(coalesce(nullif(recommendation, ''), '-'), '|', '/') || ' | ' ||
+        replace(coalesce(nullif(benefit, ''), '-'), '|', '/') || ' | ' ||
+        replace(coalesce(nullif(cost, ''), '-'), '|', '/') || ' | ' ||
+        replace(steps_text, '|', '/') || ' |',
+        E'\n' ORDER BY id),
+    'No findings.')
+FROM s;
+SQL
+}
+
+# advice_json <base query>
+advice_json() {
+    local base="$1"
+    cat <<SQL
+SELECT jsonb_pretty(coalesce(jsonb_agg(to_jsonb(r)), '[]'::jsonb))
+FROM (
+$base
+) r;
+SQL
+}
+
+# render_advice <base query>
+#
+# Dispatches on the requested output format.
+render_advice() {
+    local base="$1"
+    case "$OUTPUT" in
+        text)     advice_text "$base"     | run_sql "-q -A -t" ;;
+        markdown) advice_markdown "$base" | run_sql "-q -A -t" ;;
+        json)     advice_json "$base"     | run_sql "-q -A -t" ;;
+    esac
+}
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+case "$COMMAND" in
+
+collect)
+    cat <<SQL | run_sql "-q"
+SELECT 'collected' AS action,
+       sample_id,
+       captured_at,
+       statements,
+       tables
+FROM sta.collect()
+ORDER BY captured_at DESC
+LIMIT 1;
+SQL
+    ;;
+
+reset)
+    echo "SELECT * FROM sta.reset();" | run_sql "-q"
+    ;;
+
+report)
+    if [ -n "$SQL_ARG" ]; then
+        lit=$(sql_literal "$SQL_ARG")
+    else
+        lit="NULL"
+    fi
+    base="SELECT finding_id::int AS id,
+       severity,
+       category,
+       coalesce(object_name, left(coalesce(query, ''), 70)) AS subject,
+       finding,
+       finding_text AS detail,
+       recommendation,
+       expected_benefit AS benefit,
+       estimated_cost AS cost,
+       validation_steps AS steps,
+       confidence
+FROM sta.recommendations($lit, '$WINDOW', $ANALYZE, $LIMIT)"
+    render_advice "$base"
+    ;;
+
+workload)
+    base="$(project_advice "left(coalesce(query, ''), 70)")
+FROM sta.workload_advice('$WINDOW', 0, 0, $LIMIT)"
+    render_advice "$base"
+    ;;
+
+plan)
+    base="$(project_advice "coalesce(object_name, '-')")
+FROM sta.plan_advice($(sql_literal "$SQL_ARG"), $ANALYZE, $LIMIT)"
+    render_advice "$base"
+    ;;
+
+stats)
+    if [ -n "$SCHEMA_ARG" ]; then
+        sch="'$(printf '%s' "$SCHEMA_ARG" | sed "s/'/''/g")'"
+    else
+        sch="NULL"
+    fi
+    base="$(project_advice "coalesce(object_name, '-')")
+FROM sta.stats_advice($sch, $LIMIT)"
+    render_advice "$base"
+    ;;
+
+diff)
+    if [ -n "$SCHEMA_ARG" ]; then
+        sch="'$(printf '%s' "$SCHEMA_ARG" | sed "s/'/''/g")'"
+    else
+        sch="NULL"
+    fi
+    base="$(project_advice "coalesce(object_name, '-')")
+FROM sta.snapshot_diff($sch, $LIMIT)"
+    render_advice "$base"
+    ;;
+
+index)
+    cat <<SQL | run_sql "-q -A -t"
+WITH a AS (
+    SELECT relation, columns, suggested_ddl, rationale,
+           estimated_benefit, estimated_cost, confidence, validation_steps
+    FROM sta.index_advice($(sql_literal "$SQL_ARG"))
+)
+SELECT 'pg_sta: ' || count(*) || ' index candidate(s)' || E'\n\n' ||
+       coalesce(string_agg(
+           '[INDEX] ' || relation || ' (' || coalesce(array_to_string(columns, ', '), '-') || ')' || E'\n' ||
+           '  ddl:        ' || suggested_ddl || E'\n' ||
+           '  observed:   ' || rationale || E'\n' ||
+           '  benefit:    ' || coalesce(estimated_benefit, '-') || E'\n' ||
+           '  cost:       ' || coalesce(estimated_cost, '-') || E'\n' ||
+           '  confidence: ' || coalesce(confidence, '-') || E'\n' ||
+           '  validate:   ' || coalesce(array_to_string(validation_steps, E'\n               '), '-'),
+           E'\n\n'), '')
+FROM a;
+SQL
+    ;;
+
+validate)
+    cat <<SQL | run_sql "-q -A -t"
+SELECT 'verdict:        ' || verdict || E'\n' ||
+       'baseline:       ' || round(baseline_ms::numeric, 3) || ' ms' || E'\n' ||
+       'candidate:      ' || round(candidate_ms::numeric, 3) || ' ms' || E'\n' ||
+       'improvement:    ' || round(improvement_pct::numeric, 2) || ' %' || E'\n' ||
+       'plan changed:   ' || plan_changed::text || E'\n' ||
+       'rows match:     ' || rows_match::text || E'\n' ||
+       'notes:          ' || coalesce(array_to_string(notes, E'\n                '), '-')
+FROM sta.validate($(sql_literal "$DDL_ARG"), $(sql_literal "$SQL_ARG"), $ITERATIONS);
+SQL
+    ;;
+
+queryid)
+    cat <<SQL | run_sql "-q -A -t"
+SELECT 'queryid:         ' || sta.queryid($(sql_literal "$SQL_ARG")) || E'\n' ||
+       'normalized text: ' || sta.queryid_normalized($(sql_literal "$SQL_ARG"))
+SQL
+    ;;
+
+explain)
+    cat <<SQL | run_sql "-q -A -t"
+SELECT jsonb_pretty(sta.explain($(sql_literal "$SQL_ARG"), $ANALYZE));
+SQL
+    ;;
+
+catalog)
+    cat <<SQL | run_sql "-q"
+SELECT category, finding, default_severity AS severity, description,
+       evidence_source, recommended_action, validation_kind
+FROM sta.advice_catalog()
+ORDER BY category, finding;
+SQL
+    ;;
+
+server-info)
+    echo "SELECT jsonb_pretty(sta.server_info());" | run_sql "-q -A -t"
+    ;;
+
+record)
+    if [ -z "$SCOPE_ARG" ]; then die "record needs a scope (for example: report, workload, plan)"; fi
+    cat <<SQL | run_sql "-q -A -t"
+SELECT 'recorded run ' || sta.record_run(
+    $(sql_literal "$SCOPE_ARG"),
+    $(sql_literal "$TARGET_ARG"),
+    $LIMIT,
+    $(sql_literal "recorded by pg_sta_ctl"));
+SQL
+    ;;
+
+install)
+    "$HERE/install.sh"
+    ;;
+
+regress)
+    "$HERE/installcheck.sh"
+    ;;
+
+qa)
+    "$ROOT/test/run_qa.sh"
+    ;;
+esac

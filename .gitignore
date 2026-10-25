@@ -1,0 +1,21 @@
+# Build artefacts
+*.o
+*.so
+*.bc
+.deps/
+tmp_check/
+results/
+regression.diffs
+regression.out
+*.actual
+
+# Editors
+*~
+*.swp
+.DS_Store
+.idea/
+.vscode/
+
+# Local logs and scratch files
+*.log
+/tmp/
