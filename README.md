@@ -99,6 +99,15 @@ Or from the command line:
 ./scripts/pg_sta_ctl --database appdb report
 ```
 
+No database to try it on? Load the demo fixture — two tables, a captured
+workload and a ready-made plan-advice example:
+
+```bash
+./scripts/load_sample_data.sh --database appdb
+./scripts/pg_sta_ctl --database appdb collect
+./scripts/pg_sta_ctl --database appdb report
+```
+
 The command line client picks its transport automatically: it talks to the
 development VM over SSH when the VM is reachable, and falls back to the
 local `psql` client when the script runs on the database host itself. Use
@@ -131,13 +140,16 @@ reproduces both on PostgreSQL 17.
 
 ```sql
 -- generate PostgreSQL 19 style advice from a plan
+-- (the tables must exist in the database: the plan is read from the
+--  live catalogue, exactly like PostgreSQL 19 does)
 SELECT sta.plan_advice_string(
     'SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id
       WHERE c.region = ''eu''');
---  SEQ_SCAN(o) HASH_JOIN(c)
+--  HASH_JOIN(c) SEQ_SCAN(o) SEQ_SCAN(c)
 
 -- plan a statement with that advice applied, then restore the session
-SELECT * FROM sta.explain_with_advice('SEQ_SCAN(o)',
+SELECT * FROM sta.explain_with_advice(
+    'HASH_JOIN(c) SEQ_SCAN(o) SEQ_SCAN(c)',
     'SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id
       WHERE c.region = ''eu''');
 --  plan | applied | restored
@@ -150,6 +162,10 @@ SELECT sta.set_stashed_advice('nightly',
 SELECT * FROM sta.get_stash_contents('nightly');
 --  stash_name | query_id | advice_string
 ```
+
+A ready-made fixture with `orders`, `customers` and a captured workload is
+installed by `scripts/load_sample_data.sh`; see
+[docs/usage.md](docs/usage.md#5-a-database-to-try-it-on).
 
 ```bash
 ./scripts/pg_sta_ctl --database appdb plan-advice "SELECT * FROM orders"
@@ -257,7 +273,9 @@ pg_sta/
 ├── src/pg_sta.c             C core: queryid, normalisation, EXPLAIN, server info
 ├── sql/
 │   ├── pg_sta--0.1.0.sql    the advisory engine (schema "sta")
-│   └── pg_sta.sql           regression test
+│   ├── pg_sta.sql           regression test
+│   ├── sample_data.sql      demo schema: orders, customers, workload
+│   └── sample_workload.sql  a captured workload for the demo schema
 ├── expected/pg_sta.out      recorded regression output
 ├── scripts/
 │   ├── pg_sta_ctl           command line client
@@ -267,10 +285,11 @@ pg_sta/
 │   ├── install.sh           sync + build + install
 │   ├── reload.sh            reload the extension
 │   ├── psql.sh              psql as postgres over SSH or locally
+│   ├── load_sample_data.sh  load a demo schema, workload and advice
 │   └── installcheck.sh      run the regression suite
 ├── test/
 │   ├── qa_setup.sql         deliberate-defect fixture, split into phases
-│   ├── qa_assertions.sql    87 assertions
+│   ├── qa_assertions.sql    89 assertions
 │   └── run_qa.sh            the QA runner
 ├── packaging/pg_sta.spec    RPM package
 └── docs/                    the documentation set
@@ -282,7 +301,7 @@ pg_sta/
 
 ```bash
 make installcheck PG_CONFIG=/usr/pgsql-17/bin/pg_config   # regression suite
-make qa                                                     # QA suite (87 assertions)
+make qa                                                     # QA suite (89 assertions)
 ```
 
 The QA suite seeds a database with **deliberate defects** — an unanalysed

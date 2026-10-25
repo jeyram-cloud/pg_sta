@@ -210,6 +210,19 @@ Because the previous values are recorded rather than assumed, applying
 advice twice, or applying advice after the caller has changed a setting
 itself, still restores the session correctly.
 
+The advice string is derived from a **live** plan: the statement is
+explained and every node that names a relation is translated into the
+advice item that reproduces it (`SEQ_SCAN(t)`, `HASH_JOIN(c)`, …). A hash
+join is named after the relation that is built into the hash table, which
+is the child that carries the `Hash` node — not simply the first child.
+The nodes that do not name a relation (joins, gathers) are kept in the
+walk as well, otherwise the join advice would be lost.
+
+The list that `sta.apply_advice()` returns names every **distinct**
+setting that was changed, in the form `TAG:guc=value`. The same advice
+tag may appear more than once in one advice string (one item per
+relation); the setting is still written once and reported once.
+
 The full parity analysis — what is identical to PostgreSQL 19 and what is
 an approximation forced by the absence of a planner hook — is in
 [pg19-compatibility.md](pg19-compatibility.md).
@@ -428,7 +441,7 @@ when the output differs. This catches *behavioural* changes.
 | `sta_qa.big_events` | 120 000 rows, hot query, no supporting index | `SEQ_SCAN_ON_LARGE_TABLE` |
 | `sta_qa.hot_path` | very high call count | `HIGH_FREQUENCY` |
 
-`test/qa_assertions.sql` contains 87 assertions in a machine-readable
+`test/qa_assertions.sql` contains 89 assertions in a machine-readable
 `assertion | expected | actual | passed` form. `test/run_qa.sh` runs the
 setup, then evaluates the assertions and reports the pass count.
 

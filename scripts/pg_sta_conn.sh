@@ -115,12 +115,17 @@ pg_sta_ssh() {
 }
 
 # Copy a file or tree to the target machine.
+#
+# scp is used rather than rsync: the rsync on macOS is Apple's openrsync,
+# which is not protocol compatible with the rsync of the AlmaLinux guest and
+# fails with "unexpected end of file" when a single file is transferred.
 pg_sta_push() {
     local src="$1" dst="$2"
     if [ "$PG_STA_MODE" = "ssh" ]; then
-        rsync -az \
-            -e "ssh -i $PG_STA_SSH_KEY -p $PG_STA_SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
-            "$src" "$dst"
+        scp -q -r -i "$PG_STA_SSH_KEY" -P "$PG_STA_SSH_PORT" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$src" "vagrant@$PG_STA_HOST:$dst"
     else
         cp -a "$src" "$dst"
     fi

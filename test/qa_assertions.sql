@@ -582,6 +582,23 @@ BEGIN
     INSERT INTO qa_result VALUES (default, 'advice: the generated advice only uses known tags',
                                   '0', v_cnt::text, v_cnt = 0);
 
+    -- A join node names no relation of its own, so it is easy to lose it
+    -- while collecting the advice.  The join item is the one that tells
+    -- the planner which join method the plan used, so it must be there.
+    SELECT count(*) INTO v_cnt
+      FROM sta._advice_parse(v_advice) p
+     WHERE p.tag IN ('HASH_JOIN', 'MERGE_JOIN', 'NESTED_LOOP_PLAIN');
+    INSERT INTO qa_result VALUES (default, 'advice: the advice contains the join item',
+                                  '>=1', v_cnt::text, v_cnt >= 1);
+
+    -- The join item names the relation that is hashed, which is not
+    -- necessarily the relation that appears first in the plan.
+    SELECT count(*) INTO v_cnt
+      FROM sta._advice_parse(v_advice) p
+     WHERE p.tag = 'HASH_JOIN' AND p.targets = ARRAY['d1'];
+    INSERT INTO qa_result VALUES (default, 'advice: the join item names the hashed relation',
+                                  '>=1', v_cnt::text, v_cnt >= 1);
+
     -- ---- round trip -----------------------------------------------------
     -- The central guarantee of the feature: the advice generated from a
     -- plan must reproduce that very plan when it is applied.

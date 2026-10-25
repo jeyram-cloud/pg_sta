@@ -563,6 +563,32 @@ WHERE p.tag NOT IN (SELECT tag FROM sta.plan_advice_tag);
  t
 (1 row)
 
+-- 12.4b A join produces a join advice item.  A join node names no
+--        relation of its own, so it is easy to lose it while collecting
+--        the advice; the item is what tells the planner which join
+--        method the plan used.
+SELECT count(*) > 0 AS plan_advice_contains_the_join_item
+FROM sta._advice_parse(sta.plan_advice_string(
+         'SELECT * FROM sta_regress.orders o
+            JOIN sta_regress.tiny t ON t.id = o.customer_id')) p
+WHERE p.tag IN ('HASH_JOIN', 'MERGE_JOIN', 'NESTED_LOOP_PLAIN');
+ plan_advice_contains_the_join_item 
+------------------------------------
+ t
+(1 row)
+
+-- 12.4c The join item names the relation that is hashed, not the one
+--        that is scanned first.
+SELECT count(*) = 1 AS plan_advice_names_the_hashed_relation
+FROM sta._advice_parse(sta.plan_advice_string(
+         'SELECT * FROM sta_regress.orders o
+            JOIN sta_regress.tiny t ON t.id = o.customer_id')) p
+WHERE p.tag = 'HASH_JOIN' AND p.targets = ARRAY['t'];
+ plan_advice_names_the_hashed_relation 
+---------------------------------------
+ t
+(1 row)
+
 -- 12.5 The round-trip property: the advice generated from a plan
 -- reproduces that plan when it is applied.
 SELECT sta.explain(

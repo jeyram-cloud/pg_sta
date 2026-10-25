@@ -101,8 +101,15 @@ the difference between "applied" and "cannot be applied on this server".
 SELECT sta.plan_advice_string(
     'SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id
       WHERE c.region = ''eu''');
---  SEQ_SCAN(o) HASH_JOIN(c)
+--  HASH_JOIN(c) SEQ_SCAN(o) SEQ_SCAN(c)
 ```
+
+The advice is read from a **live** plan of the statement, exactly as
+PostgreSQL 19 does: the relations named in the statement must exist in the
+database, and the advice therefore describes the plan the planner actually
+chose.  A statement that names a missing relation fails with
+`relation "..." does not exist` — that is the intended behaviour, not a
+defect.
 
 The generated string is written in the PostgreSQL 19 advice language and can
 be fed straight back into `sta.explain_with_advice()`.

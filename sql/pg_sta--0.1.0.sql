@@ -2533,15 +2533,35 @@ BEGIN
                       AND jsonb_array_length(t.node->'Plans') > 0
                    THEN COALESCE(t.node->'Plans'->0->>'Alias',
                                  t.node->'Plans'->0->>'Relation Name')
-               END AS child_alias
+               END AS child_alias,
+               -- The relation that is built into the hash table, when the
+               -- node has one.  A hash join is named after that relation,
+               -- because that is the one that gets hashed.
+               (SELECT hashed.alias
+                  FROM (
+                        SELECT COALESCE(hc.node->'Plans'->0->>'Alias',
+                                        hc.node->'Plans'->0->>'Relation Name') AS alias
+                          FROM jsonb_array_elements(
+                                   CASE WHEN jsonb_typeof(t.node->'Plans') = 'array'
+                                        THEN t.node->'Plans' ELSE '[]'::jsonb END
+                                 ) AS hc(node)
+                         WHERE hc.node->>'Node Type' = 'Hash'
+                         LIMIT 1
+                       ) AS hashed
+                 WHERE hashed.alias IS NOT NULL
+               ) AS hash_alias
         FROM tree t
         WHERE t.node IS NOT NULL
     ),
     numbered AS (
+        -- The window function is only meaningful for the nodes that name a
+        -- relation, but the rows must not be filtered here: a join or a
+        -- gather node has no relation of its own and would be lost, and
+        -- with it the HASH_JOIN(), MERGE_JOIN(), NESTED_LOOP_PLAIN(),
+        -- GATHER() and GATHER_MERGE() advice of the plan.
         SELECT n.*,
                count(*) OVER (PARTITION BY n.rel_alias ORDER BY n.path) AS occurrence
         FROM nodes n
-        WHERE n.rel_alias IS NOT NULL
     ),
     items AS (
         SELECT path,
@@ -2556,7 +2576,7 @@ BEGIN
                                           || ' ' || index_name || ')'
                  WHEN 'Bitmap Heap Scan' THEN 'BITMAP_HEAP_SCAN(' || rel_alias
                                           || CASE WHEN occurrence > 1 THEN '#' || occurrence ELSE '' END || ')'
-                 WHEN 'Hash Join'        THEN 'HASH_JOIN(' || child_alias || ')'
+                 WHEN 'Hash Join'        THEN 'HASH_JOIN(' || coalesce(nullif(hash_alias, ''), child_alias) || ')'
                  WHEN 'Merge Join'       THEN 'MERGE_JOIN(' || child_alias || ')'
                  WHEN 'Nested Loop'      THEN 'NESTED_LOOP_PLAIN(' || child_alias || ')'
                  WHEN 'Gather'           THEN 'GATHER(' || child_alias || ')'
@@ -2766,6 +2786,7 @@ DECLARE
     v_applied  text[] := '{}';
     v_previous text;
     v_seen     text[] := '{}';
+    v_reported text[] := '{}';
 BEGIN
     -- A second apply starts from a clean baseline so that the recorded state
     -- always describes the values that were in force before any advice.
@@ -2801,8 +2822,18 @@ BEGIN
             END IF;
 
             PERFORM set_config(v_guc.guc_name, v_guc.guc_value, false);
-            v_applied := array_append(v_applied,
-                                      v_item.tag || ':' || v_guc.guc_name || '=' || v_guc.guc_value);
+
+            -- The same tag may appear more than once in one advice string
+            -- (one item per relation, for example).  Report each distinct
+            -- setting once, so that the list describes the settings that
+            -- were changed rather than the items that were parsed.
+            IF NOT (v_item.tag || ':' || v_guc.guc_name || '=' || v_guc.guc_value
+                    = ANY (v_reported)) THEN
+                v_applied := array_append(v_applied,
+                                          v_item.tag || ':' || v_guc.guc_name || '=' || v_guc.guc_value);
+                v_reported := v_reported
+                             || (v_item.tag || ':' || v_guc.guc_name || '=' || v_guc.guc_value);
+            END IF;
         END LOOP;
 
         IF NOT EXISTS (SELECT 1 FROM sta.plan_advice_guc g

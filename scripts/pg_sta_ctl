@@ -48,6 +48,7 @@
 #   server-info              version and configuration of the server
 #   record SCOPE [TARGET]    record an advisory run in the audit trail
 #   diff [SCHEMA]            compare the two most recent snapshots of a schema
+#   load-sample-data         create the sample tables and generate a workload
 #   install                  build and install the extension on the VM
 #   regress                  run the regression suite
 #   qa                       run the QA suite
@@ -67,6 +68,7 @@
 #   pg_sta_ctl --database appdb stash create nightly
 #   pg_sta_ctl --database appdb stash set nightly 1234567890 "SEQ_SCAN(orders)"
 #   pg_sta_ctl --database appdb stash show nightly
+#   pg_sta_ctl --database appdb load-sample-data --analyze-all
 #
 set -euo pipefail
 
@@ -91,6 +93,7 @@ ADVICE_ARG=""
 STASH_CMD=""
 STASH_NAME=""
 QID_ARG=""
+EXTRA_ARGS=()
 
 die() { echo "pg_sta_ctl: $*" >&2; exit 1; }
 
@@ -161,6 +164,10 @@ case "$COMMAND" in
         if [ $# -ge 1 ]; then SCOPE_ARG="$1"; shift; fi
         if [ $# -ge 1 ]; then TARGET_ARG="$1"; shift; fi ;;
     collect|reset|workload|catalog|server-info|install|regress|qa) ;;
+    load-sample-data)
+        # The remaining arguments belong to the loader.
+        EXTRA_ARGS=("$@")
+        ;;
     *) die "unknown command: $COMMAND" ;;
 esac
 
@@ -329,10 +336,11 @@ render_advice() {
 # same transport and the user is told which one was chosen.
 pg_sta_resolve_mode
 
-# The build and test commands create the extension themselves; every other
-# command reads it from the target database, so it has to be there already.
+# The build and test commands create the extension themselves; the loader
+# creates it as well.  Every other command reads it from the target
+# database, so it has to be there already.
 case "$COMMAND" in
-    install|regress|qa) ;;
+    install|regress|qa|load-sample-data) ;;
     *) require_extension ;;
 esac
 
@@ -548,6 +556,11 @@ SQL
 
 install)
     "$HERE/install.sh"
+    ;;
+
+load-sample-data)
+    "$HERE/load_sample_data.sh" --database "$DB" \
+        ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
     ;;
 
 regress)

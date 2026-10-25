@@ -137,9 +137,10 @@ The developer scripts in `scripts/` do this automatically:
 | `src/pg_sta.c` | the C core: plan capture, query ids, server introspection |
 | `sql/pg_sta--0.1.0.sql` | the advisory engine, the catalogue and the sample tables |
 | `sql/pg_sta.sql` | the regression suite (pg_regress) |
+| `sql/sample_data.sql`, `sql/sample_workload.sql` | the demo schema and the demo workload |
 | `scripts/pg_sta_ctl` | the command line client |
-| `scripts/*.sh` | build, install, reload and test helpers for the dev VM |
-| `test/qa_setup.sql`, `test/qa_assertions.sql` | the QA suite (87 assertions) |
+| `scripts/*.sh` | build, install, reload, sample-data and test helpers for the dev VM |
+| `test/qa_setup.sql`, `test/qa_assertions.sql` | the QA suite (89 assertions) |
 | `docs/` | the operational and design documentation |
 | `packaging/pg_sta.spec` | an RPM spec file |
 
@@ -210,6 +211,38 @@ SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_sta','pg_stat
 
 `pg_sta` creates its own schema `sta` with five tables and the advisory
 functions. It never touches user schemas.
+
+### 4.1 A database to try it on
+
+The examples in this document use two tables, `customers` and `orders`.
+A ready-made fixture for them is included:
+
+```bash
+./scripts/load_sample_data.sh --database appdb
+```
+
+It creates the two tables, fills them with a deterministic data set and
+runs a small workload, so that `pg_stat_statements` has something to
+report. The transport is detected automatically, so the same command works
+on the workstation and on the database host.
+
+```
+target database: appdb (transport: ssh)
+==> loading the sample tables
+==> running the sample workload (120 iterations per statement)
+customers:                 2000
+orders:                    120000
+pg_stat_statements rows:  9
+```
+
+`orders` is deliberately left un-analysed, so the statistics advice has a
+subject. Pass `--analyze-all` to analyse it as well, `--iterations N` to
+run a longer workload, and `--force` to drop and recreate the sample
+tables. Only tables carrying the `pg_sta sample data` marker comment are
+ever dropped.
+
+> The fixture writes to the `public` schema of the target database. Use a
+> scratch database, never a production one.
 
 ---
 
@@ -480,9 +513,9 @@ When the transport falls back to the local client the scripts say so once:
 pg_sta: no SSH access to 127.0.0.1:2201; using the local psql client
 ```
 
-Every command except `install`, `regress` and `qa` first checks that the
-`pg_sta` extension exists in the target database and reports what to do
-when it does not:
+Every command except `install`, `regress`, `qa` and `load-sample-data` first
+checks that the `pg_sta` extension exists in the target database and
+reports what to do when it does not:
 
 ```
 pg_sta_ctl: the pg_sta extension is not installed in database 'appdb'.
@@ -514,6 +547,7 @@ pg_sta_ctl: the pg_sta extension is not installed in database 'appdb'.
 | `record SCOPE [TARGET]` | record an advisory run in the audit trail |
 | `catalog` | the catalogue of every finding the advisor knows |
 | `server-info` | version and configuration of the server |
+| `load-sample-data` | create the sample tables and generate a workload |
 | `install` | build and install the extension |
 | `regress` | run the regression suite |
 | `qa` | run the QA suite |
@@ -713,6 +747,7 @@ LIMIT 20;
 | `ERROR: could not access file "$libdir/pg_sta"` | `pg_sta.so` missing or stale | Re-run `make install`; check `pg_config --pkglibdir` |
 | `ERROR: permission denied for table workload_sample` | The calling role is not the owner | Run as the extension owner, or `GRANT USAGE ON SCHEMA sta TO <role>` |
 | `workload_advice()` returns nothing | `pg_stat_statements` is not loaded | `SHOW shared_preload_libraries;` — it must contain `pg_stat_statements` |
+| `ERROR: relation "orders" does not exist` from `sta.plan_advice_string()` | The advice is read from a **live** plan, so the relations of the statement must exist in the database — as in PostgreSQL 19 | Create the tables, or load the demo fixture: `./scripts/load_sample_data.sh --database appdb` |
 | `plan_advice()` returns nothing for a slow query | `p_analyze` was false | pass `p_analyze => true` |
 | `validate()` returns `NOT_USED` | The planner ignored the index | The index does not match the predicate; check `EXPLAIN` |
 | `validate()` returns `NOT_COMPARABLE` | Different row counts between runs | The statement is not deterministic; wrap it or use a stable predicate |

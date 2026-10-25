@@ -22,10 +22,14 @@ set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
+
+# The QA suite has a database of its own.  The default is set before the
+# connection helper is sourced, because the helper carries a default of its
+# own ("postgres"), which would otherwise win.
+PG_STA_PGDATABASE=${PG_STA_PGDATABASE:-pg_sta_qa}
+
 # shellcheck source=../scripts/pg_sta_conn.sh
 . "$ROOT/scripts/pg_sta_conn.sh"
-
-PG_STA_PGDATABASE=${PG_STA_PGDATABASE:-pg_sta_qa}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -55,7 +59,8 @@ fi
 pg_sta_ssh "mkdir -p '$WORKDIR' && chmod 755 '$WORKDIR'"
 pg_sta_push "$ROOT/test/qa_setup.sql"      "$SETUP"
 pg_sta_push "$ROOT/test/qa_assertions.sql" "$ASSERT"
-chmod 644 "$SETUP" "$ASSERT" 2>/dev/null || true
+# The files have to be readable by the postgres user on the target.
+pg_sta_ssh "chmod 644 '$SETUP' '$ASSERT' 2>/dev/null || true"
 
 echo "==> ensuring database '$PG_STA_PGDATABASE' and extension exist"
 pg_sta_ssh "

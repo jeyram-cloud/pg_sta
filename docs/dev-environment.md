@@ -70,7 +70,7 @@ cd /Users/jey/pg_sta
 ./scripts/psql.sh -d pg_sta_qa -c "SELECT * FROM sta.recommendations();"
 ```
 
-`reload.sh` runs `sync.sh` (rsync the tree to the VM), `build.sh install`
+`reload.sh` runs `sync.sh` (copy the tree to the VM), `build.sh install`
 (compile and install into the PostgreSQL tree), and then drops and
 recreates the extension. It is the fastest way to pick up a change to the
 SQL script, because the script is re-executed from scratch on every run.
@@ -91,7 +91,13 @@ SQL script, because the script is re-executed from scratch on every run.
 | 6 | `./scripts/installcheck.sh` | run the regression suite and copy the diffs back |
 | 7 | `./test/run_qa.sh` | run the QA suite |
 
-### 3.3 Connection helper
+`sync.sh` uses `rsync` when the workstation has one. The `rsync` that
+ships with macOS is Apple's `openrsync`, which is not protocol compatible
+with the `rsync` of the AlmaLinux guest; when the `rsync` fails, the
+script falls back to a `tar` stream over `ssh`, which has no such
+problem. Both paths exclude the build artefacts and the `.git` directory.
+
+### 3.3 Running psql
 
 ```bash
 ./scripts/psql.sh -d pg_sta_qa -c "SELECT version();"
@@ -101,9 +107,11 @@ cat some.sql | ./scripts/psql.sh -d pg_sta_qa
 
 `psql.sh` connects as `postgres` with `ON_ERROR_STOP=1`, so a
 failing script stops at the failing statement instead of running to the
-end.
+end. It reaches the server over SSH when the development VM is reachable
+and with the local `psql` client when the script runs on the database host
+itself — see §3.4.
 
-### 3.4 Connection helper
+### 3.4 The connection helper
 
 Every script in `scripts/` and `test/` reaches the database through the
 same helper, `scripts/pg_sta_conn.sh`. It resolves the transport once:
@@ -131,6 +139,15 @@ happens, the scripts say so once:
 ```
 pg_sta: no SSH access to 127.0.0.1:2201; using the local psql client
 ```
+
+Two operations need privileges that the `postgres` user does not have:
+
+* `make install` writes into the PostgreSQL tree, so it needs **root**.
+  Run it as `root`, or as a user with passwordless sudo (on the
+  development VM that is `vagrant`); the script says so and stops
+  otherwise.
+* `/var/lib/pgsql` is readable by `postgres` only, so a refresh of the
+  tree under that path has to run through `sudo`.
 
 ### 3.5 Environment variables
 
@@ -215,15 +232,13 @@ accepts an improvement.
 The QA suite:
 
 1. creates the fixture `sta_qa` with deliberate defects,
-2. evaluates 87 assertions in `test/qa_assertions.sql`,
+2. evaluates 89 assertions in `test/qa_assertions.sql`,
 3. prints a pass/fail line per assertion and a summary.
 
 ```
---------------------------------------------------
- assertions: 38
- passed:      38
- failed:      0
---------------------------------------------------
+--------------------------------------------------------
+total=89 passed=89 failed=0
+==> QA PASSED
 ```
 
 ### 6.1 The phase structure

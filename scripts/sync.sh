@@ -20,10 +20,24 @@ if [ "$PG_STA_MODE" = "local" ]; then
 fi
 
 echo "==> rsync $PG_STA_SRC/ -> vagrant@$PG_STA_HOST:$PG_STA_REMOTE/ (port $PG_STA_SSH_PORT)"
-rsync -az --delete --delete-excluded \
+if ! rsync -az --delete --delete-excluded \
   --exclude '.git/' \
   --exclude '*.o' --exclude '*.so' --exclude '*.bc' \
   --exclude '.deps/' --exclude 'tmp_check/' \
   --exclude 'regression.diffs' --exclude 'regression.out' \
   -e "ssh -i $PG_STA_SSH_KEY -p $PG_STA_SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
-  "$PG_STA_SRC/" "vagrant@$PG_STA_HOST:$PG_STA_REMOTE/"
+  "$PG_STA_SRC/" "vagrant@$PG_STA_HOST:$PG_STA_REMOTE/"; then
+    # The rsync of macOS is Apple's openrsync, which is not protocol
+    # compatible with the rsync of the AlmaLinux guest.  A tar stream over
+    # ssh has no such problem.
+    echo "==> rsync failed; copying the tree with tar over ssh instead"
+    tar -C "$PG_STA_SRC" -czf - \
+        --exclude='.git' \
+        --exclude='*.o' --exclude='*.so' --exclude='*.bc' \
+        --exclude='.deps' --exclude='tmp_check' \
+        --exclude='regression.diffs' --exclude='regression.out' . \
+    | ssh -i "$PG_STA_SSH_KEY" -p "$PG_STA_SSH_PORT" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "vagrant@$PG_STA_HOST" \
+            "mkdir -p '$PG_STA_REMOTE' && tar -C '$PG_STA_REMOTE' -xzf -"
+fi
