@@ -65,13 +65,84 @@ A restart is required for `shared_preload_libraries`.
 
 ## 2. Get the source
 
+`pg_sta` lives at <https://github.com/jeyram-cloud/pg_sta>. Pick whichever
+of the three methods below fits your setup.
+
+### 2.1 Clone with git (recommended)
+
 ```bash
-git clone <repository-url> pg_sta
+# HTTPS
+git clone https://github.com/jeyram-cloud/pg_sta.git
+
+# or SSH, if you have a key registered on GitHub
+git clone git@github.com:jeyram-cloud/pg_sta.git
+
 cd pg_sta
 ```
 
-Or copy the tree over SSH to the database host (this is what the developer
-scripts in `scripts/` do automatically).
+### 2.2 Download a release tarball
+
+No git? Download the archive directly:
+
+```bash
+curl -L -o pg_sta.tar.gz \
+  https://github.com/jeyram-cloud/pg_sta/archive/refs/heads/main.tar.gz
+tar -xzf pg_sta.tar.gz
+cd pg_sta-main        # the directory name carries the branch name
+```
+
+To pin a specific commit, replace `main` with the commit SHA:
+
+```bash
+curl -L -o pg_sta.tar.gz \
+  https://github.com/jeyram-cloud/pg_sta/archive/<commit-sha>.tar.gz
+```
+
+Verify the download (the repository is public, so this needs no token):
+
+```bash
+curl -s https://api.github.com/repos/jeyram-cloud/pg_sta/git/trees/main?recursive=1 \
+  | grep -c '"path"'      # 34 entries
+```
+
+### 2.3 Copy the tree to a remote database host
+
+The build has to happen **on the machine that owns the PostgreSQL
+installation**, because the installed artefacts go into that PostgreSQL
+tree. Copy the source across first:
+
+```bash
+# from your workstation
+scp -r pg_sta vagrant@<db-host>:/home/vagrant/
+scp -r pg_sta user@<db-host>:~/          # any account with write access
+
+# then, on the database host
+cd /home/vagrant/pg_sta
+make PG_CONFIG=/usr/pgsql-17/bin/pg_config
+sudo make PG_CONFIG=/usr/pgsql-17/bin/pg_config install
+```
+
+The developer scripts in `scripts/` do this automatically:
+
+```bash
+./scripts/sync.sh       # rsync the tree to the VM
+./scripts/build.sh      # build on the VM
+./scripts/install.sh    # build + install on the VM
+```
+
+### 2.4 What the tree contains
+
+| Path | Purpose |
+|---|---|
+| `src/pg_sta.c` | the C core: plan capture, query ids, server introspection |
+| `sql/pg_sta--0.1.0.sql` | the advisory engine, the catalogue and the sample tables |
+| `sql/pg_sta.sql` | the regression suite (pg_regress) |
+| `scripts/pg_sta_ctl` | the command line client |
+| `scripts/*.sh` | build, install, reload and test helpers for the dev VM |
+| `test/qa_setup.sql`, `test/qa_assertions.sql` | the QA suite (87 assertions) |
+| `docs/` | the operational and design documentation |
+| `packaging/pg_sta.spec` | an RPM spec file |
+
 
 ---
 
@@ -604,6 +675,9 @@ LIMIT 20;
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `make: *** No targets specified and no makefile found.` | Wrong directory — there is no Makefile in `/var/lib/pgsql` or in `/usr/pgsql-17/bin` | `cd` into the pg_sta source tree (on the VM: `/home/vagrant/pg_sta`) |
+| `make: *** No rule to make target 'install'.` | Same as above, plus a missing `PGXS` include | `cd` into the source tree; check that `pg_config --pgxs` resolves |
+| `curl: (22) The requested URL returned error: 404` | The branch or commit name in the tarball URL is wrong | Use `main`, or the exact commit SHA from `git ls-remote` |
 | `ERROR: extension "pg_sta" is not available` | Not installed into the PostgreSQL tree | `sudo make PG_CONFIG=... install`, then restart nothing — `CREATE EXTENSION` picks it up |
 | `ERROR: could not access file "$libdir/pg_sta"` | `pg_sta.so` missing or stale | Re-run `make install`; check `pg_config --pkglibdir` |
 | `ERROR: permission denied for table workload_sample` | The calling role is not the owner | Run as the extension owner, or `GRANT USAGE ON SCHEMA sta TO <role>` |

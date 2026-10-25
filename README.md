@@ -55,12 +55,20 @@ cannot be validated is not a recommendation.
 ## Quick start
 
 ```bash
-# 0. run every command from the directory that holds the pg_sta source
-#    tree -- this is where the Makefile lives.  A Makefile is NOT in
-#    /var/lib/pgsql or in /usr/pgsql-17/bin, so `make` there fails with
-#    "No targets specified and no makefile found".
-cd /home/vagrant/pg_sta        # the VM; on a normal host it is wherever
-                               # you unpacked the repository
+# 0. get the source
+git clone https://github.com/jeyram-cloud/pg_sta.git
+cd pg_sta
+
+#    no git? download the archive instead
+#    curl -L -o pg_sta.tar.gz \
+#      https://github.com/jeyram-cloud/pg_sta/archive/refs/heads/main.tar.gz
+#    tar -xzf pg_sta.tar.gz && cd pg_sta-main
+
+# 0b. run every command from the directory that holds the pg_sta source
+#     tree -- this is where the Makefile lives.  A Makefile is NOT in
+#     /var/lib/pgsql or in /usr/pgsql-17/bin, so `make` there fails with
+#     "No targets specified and no makefile found".
+#     On the VM the tree lives in /home/vagrant/pg_sta.
 
 # 1. build and install into your PostgreSQL 17 tree
 make PG_CONFIG=/usr/pgsql-17/bin/pg_config
@@ -92,6 +100,20 @@ Or from the command line:
 ```
 
 **Full step-by-step instructions: [docs/usage.md](docs/usage.md)**
+
+### Download options
+
+| Method | Command |
+|---|---|
+| git over HTTPS | `git clone https://github.com/jeyram-cloud/pg_sta.git` |
+| git over SSH | `git clone git@github.com:jeyram-cloud/pg_sta.git` |
+| tarball | `curl -L -o pg_sta.tar.gz https://github.com/jeyram-cloud/pg_sta/archive/refs/heads/main.tar.gz && tar -xzf pg_sta.tar.gz` |
+| pin a commit | `curl -L -o pg_sta.tar.gz https://github.com/jeyram-cloud/pg_sta/archive/<commit-sha>.tar.gz` |
+| copy to a DB host | `scp -r pg_sta vagrant@<db-host>:/home/vagrant/` |
+
+The build must run **on the machine that owns the PostgreSQL installation**,
+because the artefacts are installed into that PostgreSQL tree. See
+[docs/usage.md §2](docs/usage.md#2-get-the-source) for all three methods.
 
 ---
 
