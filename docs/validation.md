@@ -136,6 +136,96 @@ Index Scan using idx_orders_id on orders
 
 ---
 
+## 2a. `sta.plan_before_after()` and `sta.before_after_benefit()`
+
+`sta.validate()` answers one question about one kind of change: is this
+index worth having? The before/after functions answer the wider question:
+**what does this change do to the plan, and what does it gain?**
+
+```sql
+SELECT * FROM sta.plan_before_after(
+    p_sql        => 'SELECT * FROM order_details WHERE order_id = 500000',
+    p_change     => 'CREATE INDEX idx_od_order_id ON order_details (order_id)',
+    p_change_type => 'AUTO',
+    p_iterations => 3);
+```
+
+| Argument | Type | Meaning |
+|---|---|---|
+| `p_sql` | `text` | the statement as the application runs it |
+| `p_change` | `text` | the change: a `CREATE INDEX`, an `ANALYZE` / `VACUUM`, or the rewritten statement |
+| `p_change_type` | `text` | `AUTO` (detect), `NONE`, `CREATE_INDEX`, `ANALYZE`, `VACUUM_ANALYZE`, `REWRITE` |
+| `p_iterations` | `integer` | how many times to run each side (1–100, default 3) |
+
+It returns **two rows**, one for the plan before the change and one for the
+plan after it. Each row carries the readable plan (`plan_text`), the JSON
+plan (`plan`), the mean and the best execution time, the actual row count,
+the buffer counters, the node type, the index the plan uses and the plan
+signature.
+
+`sta.before_after_benefit()` calls it and returns **one row** with the
+comparison:
+
+| Return column | Meaning |
+|---|---|
+| `before_ms`, `after_ms` | the mean execution time of each side |
+| `improvement_pct` | `100 × (before − after) / before` |
+| `before_buffers`, `after_buffers` | the shared blocks each side read |
+| `plan_changed` | whether the plan *signature* changed |
+| `rows_match` | whether both sides returned the same number of rows |
+| `node_changes` | the plan change matrix: what each node became |
+| `before_plan`, `after_plan` | the readable plans |
+| `verdict` | the summary verdict |
+| `notes` | what happened, in prose |
+
+### 2a.1 The plan change matrix
+
+The matrix pairs the nodes of the two plans by their position in the
+tree and prints what each one became:
+
+```
+  Gather  ->  Index Scan on public.order_details using idx_od_order_id
+  Seq Scan on public.order_details  ->  (removed)
+```
+
+This is what makes a before/after report readable at a glance: the
+timing says **how much**, the matrix says **why**.
+
+### 2a.2 The same rollback guarantee
+
+The change is applied in a subtransaction and rolled back, exactly as in
+`sta.validate()`:
+
+```sql
+SELECT EXISTS (SELECT 1 FROM pg_indexes
+                WHERE indexname = 'idx_od_order_id');
+-- f: nothing was left behind
+```
+
+Two changes cannot be measured this way, and the tool says so:
+
+* `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, so
+  it is refused with a message that explains why.
+* `VACUUM` cannot run inside a transaction block either, so only its
+  `ANALYZE` part is executed. The statistics are refreshed, the dead
+  tuples are not removed, and the `notes` column says exactly that.
+
+### 2a.3 The verdicts
+
+The verdict is the same as the one `sta.validate()` returns, and it means
+the same thing:
+
+| Verdict | Meaning |
+|---|---|
+| `RECOMMENDED` | The plan changed, the rows match and the change was faster. |
+| `NOT_USED` | The planner ignored the change; the plan signature is unchanged. |
+| `REJECTED` | The plan changed but the change was **slower**. |
+| `NO_SIGNIFICANT_CHANGE` | The plan changed, but the timing is within the noise. |
+| `NOT_COMPARABLE` | The two sides returned a different number of rows. |
+| `ERROR` | The statement or the change failed; see `notes`. |
+
+---
+
 ## 3. The verdicts
 
 ### `RECOMMENDED`

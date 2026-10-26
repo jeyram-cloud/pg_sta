@@ -21,7 +21,7 @@ How `pg_sta` is put together and how data flows through it.
 └──────────────────────────┬───────────────────────────────────┘
                            │  narrow C ABI (5 functions)
 ┌──────────────────────────▼───────────────────────────────────┐
-│  Layer 2 — SQL advisory engine   sql/pg_sta--0.1.2.sql      │
+│  Layer 2 — SQL advisory engine   sql/pg_sta--0.1.3.sql      │
 │                                                     (2070 lines)│
 │  Everything that is policy:                                   │
 │    • which observations matter                                │
@@ -125,7 +125,7 @@ advisor:
 
 ---
 
-## 3. The SQL advisory engine (`sql/pg_sta--0.1.2.sql`)
+## 3. The SQL advisory engine (`sql/pg_sta--0.1.3.sql`)
 
 ### 3.1 Schema and objects
 
@@ -169,6 +169,11 @@ Public functions:
 | `sta.statement_advice(bigint, boolean)` | findings for one query id |
 | `sta.explain_by_queryid(bigint, boolean)` | `jsonb` |
 | `sta.advice_catalog()` | the self-describing catalogue |
+| `sta.plan_before_after(text, text, text, integer)` | the plan before and after a change |
+| `sta.before_after_benefit(text, text, text, integer)` | the benefit of a change |
+| `sta.sql_id(text)` | the Oracle-style id of the exact text |
+| `sta.sql_hash(text)` | the Oracle-style hash of the normalised text |
+| `sta.queryid_info(text)` | every identifier and the workload of a statement |
 
 ### 3.1a The PostgreSQL 19 parity layer
 
@@ -390,7 +395,7 @@ Standard PGXS. `Makefile`:
 EXTENSION   = pg_sta
 MODULE_big  = pg_sta
 OBJS        = src/pg_sta.o
-DATA        = sql/pg_sta--0.1.2.sql
+DATA        = sql/pg_sta--0.1.3.sql
 REGRESS     = pg_sta
 REGRESS_OPTS ?= --dbname=pg_sta_regress
 ```
@@ -441,7 +446,7 @@ when the output differs. This catches *behavioural* changes.
 | `sta_qa.big_events` | 120 000 rows, hot query, no supporting index | `SEQ_SCAN_ON_LARGE_TABLE` |
 | `sta_qa.hot_path` | very high call count | `HIGH_FREQUENCY` |
 
-`test/qa_assertions.sql` contains 133 assertions in a machine-readable
+`test/qa_assertions.sql` contains 162 assertions in a machine-readable
 `assertion | expected | actual | passed` form. `test/run_qa.sh` runs the
 setup, then evaluates the assertions and reports the pass count.
 

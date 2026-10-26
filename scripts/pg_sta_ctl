@@ -35,8 +35,12 @@
 #   rewrite SQL              SQL rewrite candidates for one statement
 #   actions [SQL]            the action plan: DDL, VACUUM/ANALYZE and rewrites
 #   script [SQL]             the action plan as a runnable SQL script
+#   before-after SQL [CHANGE]
+#                            the plan before and after a change, and the
+#                            benefit of the change (the change is rolled back)
 #   validate DDL SQL         measure a proposed index against the current plan
 #   queryid SQL              the canonical query id of a statement
+#   sqlid SQL                every identifier of a statement, the Oracle way
 #   explain SQL              the execution plan of a statement
 #   plan-advice SQL          PostgreSQL 19 style plan advice for one statement
 #   advice ADVICE SQL        plan one statement with an advice string applied
@@ -68,6 +72,10 @@
 #   pg_sta_ctl --database appdb index "SELECT * FROM orders WHERE customer_id = 42"
 #   pg_sta_ctl --database appdb actions "SELECT * FROM orders WHERE customer_id = 42"
 #   pg_sta_ctl --database appdb script "SELECT * FROM orders WHERE customer_id = 42" > fix.sql
+#   pg_sta_ctl --database appdb before-after \
+#       "SELECT * FROM orders WHERE customer_id = 42" \
+#       "CREATE INDEX idx_orders_customer ON orders (customer_id)"
+#   pg_sta_ctl --database appdb sqlid "SELECT * FROM orders WHERE customer_id = 42"
 #   pg_sta_ctl --database appdb validate \
 #       "CREATE INDEX idx_orders_customer ON orders (customer_id)" \
 #       "SELECT * FROM orders WHERE customer_id = 42"
@@ -94,6 +102,7 @@ ITERATIONS=3
 ANALYZE=false
 SQL_ARG=""
 DDL_ARG=""
+CHANGE_ARG=""
 SCHEMA_ARG=""
 SCOPE_ARG=""
 TARGET_ARG=""
@@ -143,6 +152,15 @@ case "$COMMAND" in
     validate)
         [ $# -ge 2 ] || die "validate needs an index DDL and a SQL statement"
         DDL_ARG="$1"; SQL_ARG="$2"; shift 2 ;;
+    before-after)
+        [ $# -ge 1 ] || die "before-after needs a SQL statement"
+        SQL_ARG="$1"; shift
+        # The change is optional: without it the statement is measured
+        # twice, which shows how much of the difference is noise.
+        if [ $# -ge 1 ]; then CHANGE_ARG="$1"; shift; fi ;;
+    sqlid)
+        [ $# -ge 1 ] || die "sqlid needs a SQL statement"
+        SQL_ARG="$1"; shift ;;
     stash)
         [ $# -ge 1 ] || die "stash needs a subcommand (list, create, drop, show, set, remove)"
         STASH_CMD="$1"; shift
@@ -517,6 +535,66 @@ script)
     fi
     cat <<SQL | run_sql "-q -A -t"
 SELECT sta.action_script($lit, '$WINDOW', $ANALYZE, $LIMIT);
+SQL
+    ;;
+
+before-after)
+    # The plan of the statement before and after the change, and the benefit
+    # of the change.  The change is rolled back: nothing is left behind.
+    if [ -n "$CHANGE_ARG" ]; then
+        chg=$(sql_literal "$CHANGE_ARG")
+    else
+        chg="NULL"
+    fi
+    cat <<SQL | run_sql "-q -A -t"
+WITH ba AS (
+    SELECT b.phase, b.change_type, b.change_sql, b.statement, b.plan_text,
+           b.exec_ms, b.best_ms, b.actual_rows, b.shared_hit, b.shared_read,
+           b.node_type, b.index_name, b.signature, b.notes
+    FROM sta.plan_before_after($(sql_literal "$SQL_ARG"), $chg, 'AUTO', $ITERATIONS) b
+),
+bn AS (
+    SELECT * FROM sta.before_after_benefit($(sql_literal "$SQL_ARG"), $chg, 'AUTO', $ITERATIONS)
+)
+SELECT 'pg_sta: the plan before and after the change' || E'\n\n' ||
+       'statement:  ' || coalesce((SELECT statement FROM ba WHERE phase = 'BEFORE'), '-') || E'\n' ||
+       'change:     ' || coalesce((SELECT change_sql FROM ba WHERE phase = 'BEFORE'), '(none)') || E'\n' ||
+       'change type: ' || coalesce((SELECT change_type FROM ba WHERE phase = 'BEFORE'), '-') || E'\n' ||
+       E'\n' ||
+       '--- BEFORE -----------------------------------------------------' || E'\n' ||
+       coalesce((SELECT plan_text FROM ba WHERE phase = 'BEFORE'), '(no plan)') || E'\n' ||
+       '--- AFTER ------------------------------------------------------' || E'\n' ||
+       coalesce((SELECT plan_text FROM ba WHERE phase = 'AFTER'), '(no plan)') || E'\n' ||
+       '--- benefit ----------------------------------------------------' || E'\n' ||
+       'before:      ' || round((SELECT before_ms FROM bn)::numeric, 3) || ' ms' || E'\n' ||
+       'after:       ' || round((SELECT after_ms FROM bn)::numeric, 3) || ' ms' || E'\n' ||
+       'improvement: ' || round((SELECT improvement_pct FROM bn)::numeric, 2) || ' %' || E'\n' ||
+       'buffers:     ' || (SELECT before_hit FROM bn) || ' -> ' || (SELECT after_hit FROM bn) ||
+           ' shared hit' || E'\n' ||
+       'plan changed: ' || (SELECT plan_changed::text FROM bn) || E'\n' ||
+       'rows match:   ' || (SELECT rows_match::text FROM bn) || E'\n' ||
+       'verdict:      ' || (SELECT verdict FROM bn) || E'\n' ||
+       'plan changes:' || E'\n' ||
+       coalesce((SELECT array_to_string(node_changes, E'\n') FROM bn), '(none)') || E'\n' ||
+       'notes:' || E'\n' ||
+       coalesce((SELECT array_to_string(notes, E'\n') FROM bn), '(none)');
+SQL
+    ;;
+
+sqlid)
+    cat <<SQL | run_sql "-q -A -t"
+SELECT 'query id:     ' || queryid || E'\n' ||
+       'sql id:       ' || sql_id || E'\n' ||
+       'sql hash:     ' || sql_hash || E'\n' ||
+       'normalized:   ' || coalesce(normalized_sql, '-') || E'\n' ||
+       'recorded:     ' || coalesce(recorded_sql, '-') || E'\n' ||
+       'in pg_stat_statements: ' || in_stat_statements::text || E'\n' ||
+       'calls:        ' || calls || E'\n' ||
+       'total time:   ' || round(total_exec_time::numeric, 3) || ' ms' || E'\n' ||
+       'mean time:    ' || round(mean_exec_time::numeric, 3) || ' ms' || E'\n' ||
+       'shared hit:   ' || shared_blks_hit || E'\n' ||
+       'shared read:  ' || shared_blks_read
+FROM sta.queryid_info($(sql_literal "$SQL_ARG"));
 SQL
     ;;
 

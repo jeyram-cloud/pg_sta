@@ -46,6 +46,8 @@ cannot be validated is not a recommendation.
 | **Action script** | `sta.action_script()` returns the whole plan as one commented, runnable file: every step carries its reason, its benefit, its cost and its validation steps |
 | **Rewrites** | `sta.rewrite_statement()` applies every rewrite rule to a statement at once and returns the complete, formatted SQL — `NOT IN` → `NOT EXISTS`, `OR` → `IN`, `col::text` → `col`, `OFFSET` → keyset pagination, `SELECT *` → the real columns |
 | **Validation** | `sta.validate()` measures a candidate index against the current plan in a rolled-back subtransaction and returns a verdict |
+| **Before / after** | `sta.plan_before_after()` shows the plan of a statement **before** a change and **after** it, with the times and the buffer counts of both; `sta.before_after_benefit()` adds the benefit, the verdict and the plan change matrix |
+| **Statement ids** | `sta.sql_id()` and `sta.sql_hash()` give the Oracle-style `SQL_ID` and `SQL_HASH`; `sta.queryid_info()` gives the `pg_stat_statements` query id, the normalised text and the workload of the statement |
 | **Explainability** | Every finding carries structured `evidence` (JSONB), not just prose |
 | **Calibratable** | All 16 decision thresholds live in `sta.threshold` and can be tuned without recompiling |
 | **Catalogue** | `sta.advice_catalog()` is the self-describing catalogue of every finding the advisor can emit |
@@ -99,6 +101,17 @@ sudo -u postgres psql -d appdb -c "
 sudo -u postgres psql -X -tA -d appdb \
   -c "SELECT sta.action_script(NULL, 'cumulative', false, 100);" > /tmp/pg_sta_actions.sql
 
+# 4d. see the plan before and after a change, and how much it gains
+sudo -u postgres psql -X -d appdb -c "
+  SELECT verdict, before_ms, after_ms, improvement_pct, node_changes
+  FROM sta.before_after_benefit(
+      'SELECT * FROM order_details WHERE order_id = 500000',
+      'CREATE INDEX idx_od_order_id ON order_details (order_id)');"
+
+# 4e. the Oracle-style identifiers of a statement
+sudo -u postgres psql -X -d appdb -c "
+  SELECT * FROM sta.queryid_info('SELECT * FROM orders WHERE customer_id = 42');"
+
 # 5. compare two snapshots and record the run
 sudo -u postgres psql -d appdb -c "SELECT * FROM sta.collect();"
 sudo -u postgres psql -d appdb -c "SELECT * FROM sta.snapshot_diff('public');"
@@ -113,6 +126,14 @@ Or from the command line:
 # the change itself, from the command line
 ./scripts/pg_sta_ctl --database appdb actions "SELECT * FROM orders WHERE customer_id = 42"
 ./scripts/pg_sta_ctl --database appdb script  "SELECT * FROM orders WHERE customer_id = 42" > fix.sql
+
+# the plan before and after a change, and the benefit of the change
+./scripts/pg_sta_ctl --database appdb before-after \
+    "SELECT * FROM order_details WHERE order_id = 500000" \
+    "CREATE INDEX idx_od_order_id ON order_details (order_id)"
+
+# the identifiers of a statement, the Oracle way
+./scripts/pg_sta_ctl --database appdb sqlid "SELECT * FROM orders WHERE customer_id = 42"
 ```
 
 No database to try it on? Load the demo fixture — two tables, a captured
@@ -267,7 +288,84 @@ depends on — `NOT IN` returns no rows at all when the subquery produces a
 single `NULL`, `NOT EXISTS` does not — so the rewrite can be judged before
 it is used.
 
-The full guide: [docs/usage.md §6.9–6.11](docs/usage.md#69-the-action-plan--the-change-as-a-runnable-statement).
+The full guide: [docs/usage.md §6.9–6.11](docs/usage.md#69-the-action-plan--the-change-as-a-runnable-statement)
+and [§7–8](docs/usage.md#7-the-plan-before-and-after-a-change) for the
+before/after report and the statement identifiers.
+
+---
+
+## The plan before and after a change
+
+The Oracle SQL Tuning Advisor does not stop at a recommendation: it shows
+the plan **before** the change, the plan **after** it, and how much the
+change gained. `pg_sta` does the same, and it leaves the database
+untouched — the change is applied in a subtransaction and rolled back.
+
+```sql
+SELECT verdict, before_ms, after_ms, improvement_pct,
+       before_buffers, after_buffers, plan_changed, rows_match,
+       node_changes
+FROM sta.before_after_benefit(
+    'SELECT * FROM order_details WHERE order_id = 500000',
+    'CREATE INDEX idx_od_order_id ON order_details (order_id)',
+    'AUTO', 3);
+```
+
+```
+    verdict    | before_ms | after_ms | improvement_pct | before_buffers | after_buffers
+--------------+-----------+----------+-----------------+----------------+---------------
+ RECOMMENDED  |    13.661 |     0.014 |           99.90 |          7353 |             1
+```
+
+```
+ plan changes:
+  Gather  ->  Index Scan on public.order_details using idx_od_order_id
+  Seq Scan on public.order_details  ->  (removed)
+```
+
+`sta.plan_before_after()` returns the two plans themselves — the readable
+text and the JSON — with the times and the buffer counts of each:
+
+```console
+$ ./scripts/pg_sta_ctl --database appdb before-after \
+      "SELECT * FROM order_details WHERE order_id = 500000" \
+      "CREATE INDEX idx_od_order_id ON order_details (order_id)"
+```
+
+The change may be a `CREATE INDEX`, an `ANALYZE`, a `VACUUM (ANALYZE)` or
+the rewritten statement; `AUTO` detects which one it is. A change that
+makes the query **slower** is reported as `REJECTED`, so a bad index
+candidate cannot be mistaken for a good one.
+
+## Statement identifiers, the Oracle way
+
+Oracle gives every statement a `V$SQL.SQL_ID` (a hash of the **exact**
+text) and a `V$SQL.SQL_HASH` (a hash of the **normalised** text).
+PostgreSQL has no built-in `SQL_ID`, but `pg_sta` provides both:
+
+| Oracle | PostgreSQL / pg_sta | What it is |
+|---|---|---|
+| `V$SQL.SQL_ID` | `sta.sql_id(sql)` | A ten-digit hash of the **exact** text. Two statements that differ only in a literal have **different** ids. |
+| `V$SQL.SQL_HASH` | `sta.sql_hash(sql)` | A hash of the **normalised** text. Two statements that differ only in a literal have the **same** hash. |
+| — | `sta.queryid(sql)` | The canonical query id of the server — the same value as `pg_stat_statements.queryid`. |
+| — | `sta.queryid_info(sql)` | All of the above, plus the workload of the statement from `pg_stat_statements`. |
+
+```console
+$ ./scripts/pg_sta_ctl --database appdb sqlid "SELECT * FROM orders WHERE customer_id = 42"
+query id:     -4644307853832973059
+sql id:       2556230741
+sql hash:     -808386326668075698
+normalized:   SELECT * FROM orders WHERE customer_id = $1
+recorded:     SELECT * FROM orders WHERE customer_id = $1
+in pg_stat_statements: true
+calls:        5
+total time:   245.194 ms
+mean time:    16.372 ms
+shared hit:   65547
+shared read:  17288
+```
+
+The full guide: [docs/usage.md §7–8](docs/usage.md#7-the-plan-before-and-after-a-change).
 
 ---
 
@@ -319,7 +417,7 @@ pg_sta: 38 finding(s)
       │
       ▼
   ┌───────────────────────────────────────────────────────────┐
-  │  SQL advisory layer (sql/pg_sta--0.1.2.sql)               │
+  │  SQL advisory layer (sql/pg_sta--0.1.3.sql)               │
   │    workload_advice()  plan_advice()  stats_advice()      │
   │    index_advice()     validate()     recommendations()   │
   │    action_plan()      action_script()                    │
@@ -364,9 +462,10 @@ pg_sta/
 ├── pg_sta.control           extension control file
 ├── src/pg_sta.c             C core: queryid, normalisation, EXPLAIN, server info
 ├── sql/
-│   ├── pg_sta--0.1.2.sql    the advisory engine (schema "sta")
-│   ├── pg_sta--0.1.0--0.1.2.sql   upgrade path from 0.1.0
-│   ├── pg_sta--0.1.1--0.1.2.sql   upgrade path from 0.1.1
+│   ├── pg_sta--0.1.3.sql    the advisory engine (schema "sta")
+│   ├── pg_sta--0.1.0--0.1.3.sql   upgrade path from 0.1.0
+│   ├── pg_sta--0.1.1--0.1.3.sql   upgrade path from 0.1.1
+│   ├── pg_sta--0.1.2--0.1.3.sql   upgrade path from 0.1.2
 │   ├── pg_sta.sql           regression test
 │   ├── orders_workload.sql  a 10-statement workload for the demo schema
 │   ├── sample_data.sql      demo schema: orders, customers, workload
@@ -387,7 +486,7 @@ pg_sta/
 │   └── installcheck.sh      run the regression suite
 ├── test/
 │   ├── qa_setup.sql         deliberate-defect fixture, split into phases
-│   ├── qa_assertions.sql    133 assertions
+│   ├── qa_assertions.sql    162 assertions
 │   └── run_qa.sh            the QA runner
 ├── packaging/pg_sta.spec    RPM package
 └── docs/                    the documentation set
@@ -399,7 +498,7 @@ pg_sta/
 
 ```bash
 make installcheck PG_CONFIG=/usr/pgsql-17/bin/pg_config   # regression suite
-make qa                                                     # QA suite (133 assertions)
+make qa                                                     # QA suite (162 assertions)
 ```
 
 The QA suite seeds a database with **deliberate defects** — an unanalysed

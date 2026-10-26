@@ -56,10 +56,15 @@ AS_PG=$(pg_sta_postgres_prefix)
 # -------------------------------------------------------------------------
 echo "==> linting the extension scripts"
 if [ -f "$ROOT/scripts/lint_sql.py" ]; then
+    # The version comes from the control file, so that the linter always
+    # checks the scripts that are about to be installed.
+    PG_STA_EXTVERSION=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" \
+        "$ROOT/pg_sta.control")
     LINT_OUT=$(python3 "$ROOT/scripts/lint_sql.py" \
-        "$ROOT/sql/pg_sta--0.1.2.sql" \
-        "$ROOT/sql/pg_sta--0.1.1--0.1.2.sql" \
-        "$ROOT/sql/pg_sta--0.1.0--0.1.2.sql" 2>&1)
+        "$ROOT/sql/pg_sta--$PG_STA_EXTVERSION.sql" \
+        "$ROOT/sql/pg_sta--0.1.0--$PG_STA_EXTVERSION.sql" \
+        "$ROOT/sql/pg_sta--0.1.1--$PG_STA_EXTVERSION.sql" \
+        "$ROOT/sql/pg_sta--0.1.2--$PG_STA_EXTVERSION.sql" 2>&1)
     if [ $? -ne 0 ]; then
         echo "$LINT_OUT"
         echo "!! the extension scripts do not pass the linter"

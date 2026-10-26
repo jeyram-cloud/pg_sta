@@ -1399,6 +1399,255 @@ BEGIN
 END
 $$;
 
+
+-- -------------------------------------------------------------------------
+-- 12. The plan before and after a change
+-- -------------------------------------------------------------------------
+--
+-- The change is applied in a subtransaction and rolled back, so the QA
+-- database is left exactly as it was.  The index used here does not exist
+-- before the test and must not exist afterwards either.
+DO $$
+DECLARE
+    v_rows    int;
+    v_phase   text;
+    v_type    text;
+    v_index   text;
+    v_plan    text;
+    v_before  text;
+    v_after   text;
+    v_sig_b   text;
+    v_sig_a   text;
+    v_sql     text := 'SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7';
+    v_ddl     text := 'CREATE INDEX qa_ba_fact_dim1 ON sta_qa.pa_fact (dim1_id)';
+    v_bench   record;
+    v_exists  boolean;
+BEGIN
+    -- The change type is detected from the text of the change.
+    SELECT change_type INTO v_type
+    FROM sta.plan_before_after(v_sql, v_ddl, 'AUTO', 1)
+    WHERE phase = 'BEFORE';
+    INSERT INTO qa_result VALUES (default,
+        'plan_before_after: the change type is detected',
+        'CREATE_INDEX', coalesce(v_type, '-'), v_type = 'CREATE_INDEX');
+
+    -- There are two rows: one before and one after.
+    SELECT count(*) INTO v_rows
+    FROM sta.plan_before_after(v_sql, v_ddl, 'AUTO', 1);
+    INSERT INTO qa_result VALUES (default,
+        'plan_before_after: one row before and one row after',
+        '2', v_rows::text, v_rows = 2);
+
+    SELECT phase INTO v_phase
+    FROM sta.plan_before_after(v_sql, v_ddl, 'AUTO', 1)
+    ORDER BY phase DESC LIMIT 1;
+    INSERT INTO qa_result VALUES (default,
+        'plan_before_after: the phases are BEFORE and AFTER',
+        'BEFORE,AFTER',
+        coalesce((SELECT string_agg(phase, ',' ORDER BY (phase = 'BEFORE') DESC)
+                  FROM sta.plan_before_after(v_sql, v_ddl, 'AUTO', 1)), '-'),
+        (SELECT count(*) = 2 FROM sta.plan_before_after(v_sql, v_ddl, 'AUTO', 1)
+          WHERE phase IN ('BEFORE', 'AFTER')));
+
+    -- The readable plan of the statement is returned.
+    SELECT plan_text INTO v_plan
+    FROM sta.plan_before_after(v_sql, v_ddl, 'AUTO', 1)
+    WHERE phase = 'BEFORE';
+    INSERT INTO qa_result VALUES (default,
+        'plan_before_after: the readable plan is returned',
+        '>=1', CASE WHEN coalesce(v_plan, '') LIKE '%Scan%' THEN '1' ELSE '0' END,
+        coalesce(v_plan, '') LIKE '%Scan%');
+
+    -- The index is used after the change.
+    SELECT index_name INTO v_index
+    FROM sta.plan_before_after(v_sql, v_ddl, 'AUTO', 1)
+    WHERE phase = 'AFTER';
+    INSERT INTO qa_result VALUES (default,
+        'plan_before_after: the new index is used after the change',
+        'qa_ba_fact_dim1', coalesce(v_index, '-'), v_index = 'qa_ba_fact_dim1');
+
+    -- The plan of the two phases is different.
+    SELECT signature INTO v_sig_b FROM sta.plan_before_after(v_sql, v_ddl, 'AUTO', 1)
+    WHERE phase = 'BEFORE';
+    SELECT signature INTO v_sig_a FROM sta.plan_before_after(v_sql, v_ddl, 'AUTO', 1)
+    WHERE phase = 'AFTER';
+    INSERT INTO qa_result VALUES (default,
+        'plan_before_after: the plan changed',
+        '1', CASE WHEN v_sig_b IS DISTINCT FROM v_sig_a THEN '1' ELSE '0' END,
+        v_sig_b IS DISTINCT FROM v_sig_a);
+
+    -- The change is rolled back: the index must not exist any more.
+    SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE c.relname = 'qa_ba_fact_dim1') INTO v_exists;
+    INSERT INTO qa_result VALUES (default,
+        'plan_before_after: the index is rolled back',
+        'f', v_exists::text, NOT v_exists);
+
+    -- The benefit of the change.
+    SELECT * INTO v_bench
+    FROM sta.before_after_benefit(v_sql, v_ddl, 'AUTO', 3);
+    INSERT INTO qa_result VALUES (default,
+        'before_after_benefit: the verdict is RECOMMENDED',
+        'RECOMMENDED', coalesce(v_bench.verdict, '-'), v_bench.verdict = 'RECOMMENDED');
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_benefit: the change is faster',
+        '1', CASE WHEN v_bench.improvement_pct > 0 THEN '1' ELSE '0' END,
+        v_bench.improvement_pct > 0);
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_benefit: the plan changed',
+        't', coalesce(v_bench.plan_changed::text, '-'), v_bench.plan_changed);
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_benefit: the number of rows is the same',
+        't', coalesce(v_bench.rows_match::text, '-'), v_bench.rows_match);
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_benefit: the plan change matrix is filled',
+        '>=1', CASE WHEN coalesce(array_length(v_bench.node_changes, 1), 0) >= 1
+                    THEN '1' ELSE '0' END,
+        coalesce(array_length(v_bench.node_changes, 1), 0) >= 1);
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_benefit: both plans are returned',
+        '>=1', CASE WHEN coalesce(v_bench.before_plan, '') <> ''
+                     AND coalesce(v_bench.after_plan, '') <> ''
+                    THEN '1' ELSE '0' END,
+        coalesce(v_bench.before_plan, '') <> ''
+        AND coalesce(v_bench.after_plan, '') <> '');
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_benefit: the notes say that nothing was left behind',
+        '>=1', CASE WHEN coalesce(array_to_string(v_bench.notes, ' '), '') LIKE '%rolled back%'
+                    THEN '1' ELSE '0' END,
+        coalesce(array_to_string(v_bench.notes, ' '), '') LIKE '%rolled back%');
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- 13. The plan change matrix
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_before jsonb;
+    v_after  jsonb;
+    v_nodes  text[];
+    v_index  text;
+BEGIN
+    v_before := sta.explain('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7', false);
+    v_after  := sta.explain('SELECT * FROM sta_qa.pa_fact ORDER BY id LIMIT 1', false);
+
+    SELECT sta._plan_node_list(v_before) INTO v_nodes;
+    INSERT INTO qa_result VALUES (default,
+        'plan change: the nodes of a plan are listed',
+        '>=1', CASE WHEN coalesce(array_length(v_nodes, 1), 0) >= 1 THEN '1' ELSE '0' END,
+        coalesce(array_length(v_nodes, 1), 0) >= 1);
+
+    INSERT INTO qa_result VALUES (default,
+        'plan change: the node list names the relation',
+        '>=1', CASE WHEN coalesce(array_to_string(v_nodes, ' '), '') LIKE '%pa_fact%'
+                    THEN '1' ELSE '0' END,
+        coalesce(array_to_string(v_nodes, ' '), '') LIKE '%pa_fact%');
+
+    SELECT sta._plan_change_matrix(v_before, v_after) INTO v_nodes;
+    INSERT INTO qa_result VALUES (default,
+        'plan change: the matrix compares two plans',
+        '>=1', CASE WHEN coalesce(array_length(v_nodes, 1), 0) >= 1 THEN '1' ELSE '0' END,
+        coalesce(array_length(v_nodes, 1), 0) >= 1);
+
+    INSERT INTO qa_result VALUES (default,
+        'plan change: the matrix uses the arrow of a change',
+        '>=1', CASE WHEN coalesce(array_to_string(v_nodes, ' '), '') LIKE '%->%'
+                    THEN '1' ELSE '0' END,
+        coalesce(array_to_string(v_nodes, ' '), '') LIKE '%->%');
+
+    -- The index of a plan is found wherever it sits in the tree: the root
+    -- of a bitmap plan is the heap scan, the index is in its child.
+    SELECT coalesce(sta._plan_index_name(
+               sta.explain('SELECT * FROM sta_qa.pa_fact WHERE id = 1', false)), '-')
+      INTO v_index;
+    INSERT INTO qa_result VALUES (default,
+        'plan change: the index of the plan is found in the tree',
+        'pa_fact_pkey', v_index, v_index = 'pa_fact_pkey');
+
+    INSERT INTO qa_result VALUES (default,
+        'plan change: a plan without an index has no index name',
+        '-', coalesce(sta._plan_index_name(
+               sta.explain('SELECT * FROM sta_qa.pa_fact ORDER BY dim1_id', false)), '-'),
+        coalesce(sta._plan_index_name(
+            sta.explain('SELECT * FROM sta_qa.pa_fact ORDER BY dim1_id', false)), '-') = '-');
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- 14. Statement identifiers, the Oracle way
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_a     text;
+    v_b     text;
+    v_hash  bigint;
+    v_hash2 bigint;
+    v_info  record;
+BEGIN
+    v_a := sta.sql_id('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7');
+    v_b := sta.sql_id('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 8');
+    INSERT INTO qa_result VALUES (default,
+        'sql_id: the same text gives the same id',
+        '1', CASE WHEN v_a = sta.sql_id('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7')
+                  THEN '1' ELSE '0' END,
+        v_a = sta.sql_id('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7'));
+
+    INSERT INTO qa_result VALUES (default,
+        'sql_id: a different text gives a different id',
+        '1', CASE WHEN v_a <> v_b THEN '1' ELSE '0' END, v_a <> v_b);
+
+    INSERT INTO qa_result VALUES (default,
+        'sql_id: the id has ten digits',
+        '10', length(v_a)::text, length(v_a) = 10);
+
+    INSERT INTO qa_result VALUES (default,
+        'sql_id: the id is a number',
+        '1', CASE WHEN v_a ~ '^[0-9]{10}$' THEN '1' ELSE '0' END,
+        v_a ~ '^[0-9]{10}$');
+
+    -- The hash is taken from the normalised text, so the literals do not
+    -- change it.  This is the Oracle SQL_HASH behaviour.
+    v_hash  := sta.sql_hash('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7');
+    v_hash2 := sta.sql_hash('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 8');
+    INSERT INTO qa_result VALUES (default,
+        'sql_hash: the literals do not change the hash',
+        '1', CASE WHEN v_hash = v_hash2 THEN '1' ELSE '0' END, v_hash = v_hash2);
+
+    -- The query id is the one that pg_stat_statements uses.
+    SELECT * INTO v_info
+    FROM sta.queryid_info('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7');
+    INSERT INTO qa_result VALUES (default,
+        'queryid_info: the query id matches sta.queryid',
+        '1', CASE WHEN v_info.queryid = sta.queryid('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7')
+                  THEN '1' ELSE '0' END,
+        v_info.queryid = sta.queryid('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7'));
+
+    INSERT INTO qa_result VALUES (default,
+        'queryid_info: the sql id matches sta.sql_id',
+        '1', CASE WHEN v_info.sql_id = sta.sql_id('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7')
+                  THEN '1' ELSE '0' END,
+        v_info.sql_id = sta.sql_id('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7'));
+
+    INSERT INTO qa_result VALUES (default,
+        'queryid_info: the normalised text has a placeholder',
+        '>=1', CASE WHEN coalesce(v_info.normalized_sql, '') LIKE '%$1%' THEN '1' ELSE '0' END,
+        coalesce(v_info.normalized_sql, '') LIKE '%$1%');
+
+    INSERT INTO qa_result VALUES (default,
+        'queryid_info: the hash matches sta.sql_hash',
+        '1', CASE WHEN v_info.sql_hash = sta.sql_hash('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7')
+                  THEN '1' ELSE '0' END,
+        v_info.sql_hash = sta.sql_hash('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7'));
+END
+$$;
+
 -- -------------------------------------------------------------------------
 -- Final report
 -- -------------------------------------------------------------------------

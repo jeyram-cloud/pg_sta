@@ -31,6 +31,10 @@ only the extension interfaces PostgreSQL provides:
 | How do I rewrite this statement? | `sta.rewrite_statement()` |
 | How do I validate a proposed change? | `sta.validate()` |
 | Did the change help, without regressions? | `sta.validate()` |
+| What does the plan look like before and after a change? | `sta.plan_before_after()` |
+| How much does the change actually gain me? | `sta.before_after_benefit()` |
+| What is the Oracle-style id of my statement? | `sta.sql_id()`, `sta.sql_hash()` |
+| What is the `pg_stat_statements` id of my statement? | `sta.queryid_info()` |
 
 Every finding carries the same envelope: **what was observed**, **what to
 do**, **the expected benefit**, **the cost**, and **the exact steps to
@@ -138,12 +142,12 @@ The developer scripts in `scripts/` do this automatically:
 | Path | Purpose |
 |---|---|
 | `src/pg_sta.c` | the C core: plan capture, query ids, server introspection |
-| `sql/pg_sta--0.1.2.sql` | the advisory engine, the catalogue and the sample tables |
+| `sql/pg_sta--0.1.3.sql` | the advisory engine, the catalogue and the sample tables |
 | `sql/pg_sta.sql` | the regression suite (pg_regress) |
 | `sql/sample_data.sql`, `sql/sample_workload.sql` | the demo schema and the demo workload |
 | `scripts/pg_sta_ctl` | the command line client |
 | `scripts/*.sh` | build, install, reload, sample-data and test helpers for the dev VM |
-| `test/qa_setup.sql`, `test/qa_assertions.sql` | the QA suite (133 assertions) |
+| `test/qa_setup.sql`, `test/qa_assertions.sql` | the QA suite (162 assertions) |
 | `docs/` | the operational and design documentation |
 | `packaging/pg_sta.spec` | an RPM spec file |
 
@@ -184,7 +188,7 @@ sudo make PG_CONFIG=/usr/pgsql-17/bin/pg_config install
 
 - `pg_sta.so` → `$(pg_config --pkglibdir)`
 - `pg_sta.control` → `$(pg_config --sharedir)/extension`
-- `pg_sta--0.1.2.sql` → `$(pg_config --sharedir)/extension`
+- `pg_sta--0.1.3.sql` → `$(pg_config --sharedir)/extension`
 
 ---
 
@@ -558,7 +562,169 @@ produced for the statement as the application really writes it.
 
 ---
 
-## 7. Validate a proposed change
+## 7. The plan before and after a change
+
+This is the Oracle SQL Tuning Advisor "before/after" report: the plan of
+the statement **as it runs today**, the plan of the same statement **after
+the proposed change**, and the **benefit** the change produced.
+
+### 7.1 The two plans
+
+```sql
+SELECT phase, change_type, exec_ms, shared_hit, node_type, index_name,
+       plan_text
+FROM   sta.plan_before_after(
+           p_sql    => 'SELECT * FROM order_details WHERE order_id = 500000',
+           p_change => 'CREATE INDEX idx_od_order_id ON order_details (order_id)',
+           p_iterations => 3);
+```
+
+```
+ phase  | change_type | exec_ms | shared_hit | node_type  | index_name
+--------+-------------+---------+------------+------------+-----------
+ BEFORE | CREATE_INDEX | 21.331 |         84 | Gather     |
+ AFTER  | CREATE_INDEX |  0.014 |          4 | Index Scan | idx_od_order_id
+```
+
+Both rows carry the **readable plan** in `plan_text` and the **machine
+readable plan** in `plan`:
+
+```
+--- BEFORE -----------------------------------------------------
+Gather  (cost=1000.00..13561.43 rows=1 width=28) (actual time=12.888..13.118 rows=1 loops=1)
+  Workers Planned: 2
+  Workers Launched: 2
+  Buffers: shared hit=7353
+  ->  Parallel Seq Scan on order_details  (cost=0.00..12561.33 rows=1 width=28) (actual time=8.008..9.875 rows=0 loops=3)
+        Filter: (order_id = 500000)
+        Rows Removed by Filter: 333333
+        Buffers: shared hit=7353
+Planning Time: 0.021 ms
+Execution Time: 13.125 ms
+
+--- AFTER ------------------------------------------------------
+Index Scan using idx_od_order_id on order_details  (cost=0.42..2.64 rows=1 width=28) (actual time=0.001..0.001 rows=1 loops=1)
+  Index Cond: (order_id = 500000)
+  Buffers: shared hit=4
+Planning Time: 0.006 ms
+Execution Time: 0.004 ms
+```
+
+> The change is applied in a **subtransaction** and rolled back, so the
+> database is left exactly as it was. Nothing is left behind: no index, no
+> changed statistics.
+
+### 7.2 The benefit and the plan change matrix
+
+```sql
+SELECT verdict, before_ms, after_ms, improvement_pct,
+       before_buffers, after_buffers, plan_changed, rows_match,
+       node_changes, notes
+FROM   sta.before_after_benefit(
+           p_sql    => 'SELECT * FROM order_details WHERE order_id = 500000',
+           p_change => 'CREATE INDEX idx_od_order_id ON order_details (order_id)',
+           p_iterations => 3);
+```
+
+```
+    verdict    | before_ms | after_ms | improvement_pct | plan_changed | rows_match
+--------------+-----------+----------+-----------------+--------------+------------
+ RECOMMENDED  |    13.661 |     0.014 |           99.90 | t            | t
+```
+
+```
+ plan changes:
+  Gather  ->  Index Scan on public.order_details using idx_od_order_id
+  Seq Scan on public.order_details  ->  (removed)
+```
+
+The **plan change matrix** lists every node of the plan and what it became,
+so the change in the execution strategy is visible, not just its timing.
+
+### 7.3 The change types
+
+| `change_type` | The change is | The "after" plan is the plan of |
+|---|---|---|
+| `CREATE_INDEX` | `CREATE [UNIQUE] INDEX ...` | the same statement with the index in place |
+| `ANALYZE` | `ANALYZE table` | the same statement with fresh statistics |
+| `VACUUM_ANALYZE` | `VACUUM [ANALYZE] table` | the same statement with fresh statistics |
+| `REWRITE` | the rewritten statement | the **new text** |
+| `NONE` | nothing | the same statement again (the noise of a second measurement) |
+
+`AUTO` — the default — detects the type from the text of the change.
+
+Two restrictions apply:
+
+* `CREATE INDEX CONCURRENTLY` is refused: it cannot run inside a
+  transaction block, and the index is rolled back anyway.
+* `VACUUM` cannot run inside a transaction block either, so only its
+  `ANALYZE` part is executed. The note in `notes` says so. The statistics
+  are refreshed, the dead tuples are not removed — measure the vacuum
+  itself with `VACUUM` run outside the advisor.
+
+### 7.4 The verdicts
+
+| Verdict | Meaning |
+|---|---|
+| `RECOMMENDED` | The plan changed, the rows match and the change was faster. |
+| `NOT_USED` | The planner ignored the change; the plan signature is unchanged. |
+| `REJECTED` | The plan changed but the change was **slower**. |
+| `NO_SIGNIFICANT_CHANGE` | The plan changed, but the timing is within the noise. |
+| `NOT_COMPARABLE` | The two runs returned a different number of rows. |
+| `ERROR` | The statement or the change failed; see `notes`. |
+
+---
+
+## 8. Statement identifiers, the Oracle way
+
+Oracle gives every statement two identifiers: `V$SQL.SQL_ID` (a hash of
+the **exact** text) and `V$SQL.SQL_HASH` (a hash of the **normalised**
+text). PostgreSQL has no built-in equivalent of `SQL_ID`, but `pg_sta`
+provides both.
+
+| Oracle | PostgreSQL / pg_sta | What it is |
+|---|---|---|
+| `V$SQL.SQL_ID` | `sta.sql_id(sql)` | A ten-digit hash of the **exact** text of the statement. Two statements that differ only in a literal have **different** ids. |
+| `V$SQL.SQL_HASH` | `sta.sql_hash(sql)` | A hash of the **normalised** text (the literals become `$1`, `$2`, ...). Two statements that differ only in a literal have the **same** hash. |
+| — | `sta.queryid(sql)` | The **canonical query id** of the server: the same value as `pg_stat_statements.queryid`. |
+| — | `sta.queryid_normalized(sql)` | The normalised text, as `pg_stat_statements` stores it. |
+| `V$SQL.SQL_ID` + `V$SQL.SQL_PLAN_HASH_VALUE` | `sta.queryid_info(sql)` | All of the above, plus the statistics of the statement from `pg_stat_statements`. |
+
+```sql
+SELECT sta.sql_id('SELECT * FROM orders WHERE customer_id = 42');
+--  2556230741
+
+SELECT sta.sql_id('SELECT * FROM orders WHERE customer_id = 43');
+--  2556230741 is the same only for the same text; see the note below
+
+SELECT sta.sql_hash('SELECT * FROM orders WHERE customer_id = 42');
+-- -808386326668075698
+
+SELECT sta.sql_hash('SELECT * FROM orders WHERE customer_id = 43');
+-- -808386326668075698   (the same: the literals do not matter)
+
+SELECT * FROM sta.queryid_info('SELECT * FROM orders WHERE customer_id = 42');
+```
+
+```
+    queryid     |     sql_id     |            sql_hash             |   normalized
+----------------+----------------+--------------------------------+------------------
+ -4644307853832973059 |       2556230741 | -808386326668075698 | SELECT * FROM orders WHERE customer_id = $1
+```
+
+`sta.queryid_info()` also returns the workload of the statement: the number
+of calls, the total and mean time, the block counters and whether the
+statement is in `pg_stat_statements` at all.
+
+**Why `sta.sql_id()` is useful.** `pg_stat_statements` identifies a
+statement by its *normalised* text, so two statements that differ only in
+a literal share one query id, and the statistics of both are mixed
+together. `sta.sql_id()` gives the *exact* text its own id, so a report can
+name the statement the way the application wrote it.
+
+---
+
+## 9. Validate a proposed change
 
 This is the most important step: `pg_sta` never applies a change. It
 *measures* a change.
@@ -606,7 +772,7 @@ The verdict is one of:
 
 ---
 
-## 8. Command line interface
+## 10. Command line interface
 
 `scripts/pg_sta_ctl` wraps the whole API.
 
@@ -626,6 +792,14 @@ The verdict is one of:
 # the change itself: the action plan and the runnable script
 ./scripts/pg_sta_ctl -d appdb actions "SELECT * FROM orders WHERE customer_id = 42"
 ./scripts/pg_sta_ctl -d appdb script  "SELECT * FROM orders WHERE customer_id = 42" > fix.sql
+
+# the plan before and after a proposed change, and how much it gains
+./scripts/pg_sta_ctl -d appdb before-after \
+    "SELECT * FROM order_details WHERE order_id = 500000" \
+    "CREATE INDEX idx_od_order_id ON order_details (order_id)"
+
+# the identifiers of a statement, the Oracle way
+./scripts/pg_sta_ctl -d appdb sqlid "SELECT * FROM orders WHERE customer_id = 42"
 ```
 
 The scripts work unchanged on the workstation and on the database host
@@ -686,7 +860,9 @@ pg_sta_ctl: the pg_sta extension is not installed in database 'appdb'.
 | `stats [SCHEMA]` | statistics findings |
 | `index SQL` | index candidates for one statement |
 | `validate DDL SQL` | measure a proposed index against the current plan |
+| `before-after SQL [CHANGE]` | the plan before and after a change, and the benefit of the change |
 | `queryid SQL` | the canonical query id and its normalised text |
+| `sqlid SQL` | every identifier of a statement: query id, SQL id, SQL hash |
 | `explain SQL` | the execution plan as JSON |
 | `plan-advice SQL` | PostgreSQL 19 style plan advice for one statement |
 | `advice ADVICE SQL` | plan one statement with an advice string applied |
@@ -705,7 +881,70 @@ pg_sta_ctl: the pg_sta extension is not installed in database 'appdb'.
 | `regress` | run the regression suite |
 | `qa` | run the QA suite |
 
-### 8.1 Plan advice and the advice stash
+### 10.1 The before/after report from the command line
+
+```console
+$ ./scripts/pg_sta_ctl -d appdb before-after \
+      "SELECT * FROM order_details WHERE order_id = 500000" \
+      "CREATE INDEX idx_od_order_id ON order_details (order_id)"
+pg_sta: the plan before and after the change
+
+statement:  SELECT * FROM order_details WHERE order_id = 500000
+change:     CREATE INDEX idx_od_order_id ON order_details (order_id)
+change type: CREATE_INDEX
+
+--- BEFORE -----------------------------------------------------
+Gather  (cost=1000.00..13561.43 rows=1 width=28) (actual time=12.888..13.118 rows=1 loops=1)
+  Workers Planned: 2
+  Workers Launched: 2
+  Buffers: shared hit=7353
+  ->  Parallel Seq Scan on order_details  (cost=0.00..12561.33 rows=1 width=28) (actual time=8.008..9.875 rows=0 loops=3)
+        Filter: (order_id = 500000)
+        Rows Removed by Filter: 333333
+        Buffers: shared hit=7353
+Planning Time: 0.021 ms
+Execution Time: 13.125 ms
+
+--- AFTER ------------------------------------------------------
+Index Scan using idx_od_order_id on order_details  (cost=0.42..2.64 rows=1 width=28) (actual time=0.001..0.001 rows=1 loops=1)
+  Index Cond: (order_id = 500000)
+  Buffers: shared hit=4
+Planning Time: 0.006 ms
+Execution Time: 0.004 ms
+
+--- benefit ----------------------------------------------------
+before:      13.661 ms
+after:       0.014 ms
+improvement: 99.90 %
+buffers:     7353 -> 1 shared hit
+plan changed: true
+rows match:   true
+verdict:      RECOMMENDED
+plan changes:
+  Gather  ->  Index Scan on public.order_details using idx_od_order_id
+  Seq Scan on public.order_details  ->  (removed)
+notes:
+The change was applied in a subtransaction and rolled back; the database is unchanged.
+```
+
+### 10.2 The identifiers of a statement from the command line
+
+```console
+$ ./scripts/pg_sta_ctl -d appdb sqlid "SELECT * FROM orders WHERE customer_id = 42"
+query id:     -4644307853832973059
+sql id:       2556230741
+sql hash:     -808386326668075698
+normalized:   SELECT * FROM orders WHERE customer_id = $1
+recorded:     SELECT * FROM orders WHERE customer_id = $1
+in pg_stat_statements: true
+calls:        5
+total time:   245.194 ms
+mean time:    16.372 ms
+shared hit:   65547
+shared read:  17288
+```
+
+### 10.3 Plan advice and the advice stash
 
 The two commands that mirror the PostgreSQL 19 plan-advice features:
 
@@ -749,7 +988,7 @@ Connection settings come from the environment:
 
 ---
 
-## 9. Tuning the thresholds
+## 11. Tuning the thresholds
 
 Every decision threshold lives in `sta.threshold`, so the advisor can be
 calibrated for your workload without recompiling.
@@ -787,10 +1026,10 @@ UPDATE sta.threshold SET value = 0.05 WHERE name = 'dead_tuple_ratio';
 To restore the defaults, re-run the extension script:
 
 ```sql
-\i /usr/pgsql-17/share/extension/pg_sta--0.1.2.sql
+\i /usr/pgsql-17/share/extension/pg_sta--0.1.3.sql
 ```
 
-### 9.1 Server settings
+### 11.1 Server settings
 
 Two GUCs are registered by the C core. Both are `USERSET`, so they can be
 changed per session or per role — not globally in `postgresql.conf`
@@ -827,7 +1066,7 @@ SELECT count(*) FROM sta.recommendations();   -- never more than 3
 
 ---
 
-## 10. Safety guarantees
+## 12. Safety guarantees
 
 `pg_sta` is read-only by design.
 
@@ -854,7 +1093,7 @@ statement you give them. Only pass `SELECT` statements.
 
 ---
 
-## 11. Complete worked example
+## 13. Complete worked example
 
 ```sql
 -- 1. one snapshot of the current workload
@@ -886,7 +1125,7 @@ LIMIT 20;
 
 ---
 
-## 12. Troubleshooting
+## 14. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|

@@ -52,6 +52,16 @@ CHANGED = [
     "sta.action_plan",
     "sta.action_script",
     "sta.advice_catalog",
+    "sta._explain_text",
+    "sta._plan_node_list",
+    "sta._plan_change_matrix",
+    "sta._plan_index_name",
+    "sta._measure_plan",
+    "sta.plan_before_after",
+    "sta.before_after_benefit",
+    "sta.sql_id",
+    "sta.sql_hash",
+    "sta.queryid_info",
 ]
 
 # The tables that are new in the new version.  The upgrade creates them
