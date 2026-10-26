@@ -1649,6 +1649,301 @@ END
 $$;
 
 -- -------------------------------------------------------------------------
+-- 15. The plan before and after, for every statement of the workload
+-- -------------------------------------------------------------------------
+--
+-- The report measures every change the advisor recommends against the
+-- statement it belongs to: the plan of the statement before the change,
+-- the plan after it and the benefit that was measured.  Every change is
+-- applied in a subtransaction and rolled back, so the QA database has to
+-- look exactly the same before and after the report.
+DO $$
+DECLARE
+    v_idx_before int;
+    v_idx_after  int;
+    v_targets    int;
+    v_cnt        int;
+    v_txt        text;
+    v_exists     boolean;
+    v_m          record;
+    v_c          record;
+    v_script     text;
+    v_script_np  text;
+    v_param_sql  text := 'SELECT * FROM sta_qa.pa_fact WHERE dim1_id = $1';
+    v_one_sql    text := 'SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7';
+BEGIN
+    ------------------------------------------------------------------
+    -- The state before the report
+    ------------------------------------------------------------------
+    SELECT count(*) INTO v_idx_before
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'sta_qa'
+       AND c.relkind = 'i';
+
+    SELECT count(*) INTO v_targets
+      FROM sta._workload_targets('window', 10);
+
+    ------------------------------------------------------------------
+    -- The report
+    ------------------------------------------------------------------
+    CREATE TEMP TABLE qa_report AS
+        SELECT * FROM sta.before_after_report(NULL, 'window', 2, 10, true);
+
+    ------------------------------------------------------------------
+    -- The state after the report
+    ------------------------------------------------------------------
+    SELECT count(*) INTO v_idx_after
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'sta_qa'
+       AND c.relkind = 'i';
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: every statement of the workload is reported',
+        v_targets::text,
+        (SELECT count(DISTINCT queryid) FROM qa_report)::text,
+        (SELECT count(DISTINCT queryid) FROM qa_report) = v_targets);
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: the report has a row for every statement',
+        '>=' || v_targets::text,
+        (SELECT count(*) FROM qa_report)::text,
+        (SELECT count(*) FROM qa_report) >= v_targets);
+
+    SELECT count(*) INTO v_cnt FROM qa_report WHERE change_type = 'NONE';
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: a statement without a change still gets a row',
+        '>=1', v_cnt::text, v_cnt >= 1);
+
+    SELECT count(*) INTO v_cnt FROM qa_report WHERE measurement = 'ERROR';
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: no change fails to be measured',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report
+     WHERE before_plan IS NULL OR btrim(before_plan) = '';
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: every row carries the plan before the change',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report
+     WHERE after_plan IS NULL OR btrim(after_plan) = '';
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: every row carries the plan after the change',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report
+     WHERE measurement NOT IN ('MEASURED', 'ESTIMATED');
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: the mode of the measurement is known',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report WHERE measurement <> 'MEASURED';
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: the statements of the workload can be run, so they are measured',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report
+     WHERE verdict NOT IN ('RECOMMENDED', 'REJECTED', 'NO_SIGNIFICANT_CHANGE',
+                           'NOT_USED', 'NOT_COMPARABLE', 'NOT_MEASURED');
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: the verdict is one of the known values',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report
+     WHERE plan_changed AND improvement_pct IS NULL;
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: the gain is filled in when the plan changed',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report WHERE verdict = 'RECOMMENDED';
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: at least one change is recommended',
+        '>=1', v_cnt::text, v_cnt >= 1);
+
+    SELECT count(*) INTO v_cnt FROM qa_report
+     WHERE verdict = 'RECOMMENDED' AND NOT plan_changed;
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: a recommended change changes the plan',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report
+     WHERE plan_changed AND coalesce(array_length(node_changes, 1), 0) = 0;
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: the changes of the plan are listed',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report
+     WHERE change_type = 'CREATE_INDEX'
+       AND coalesce(array_to_string(notes, ' '), '') NOT LIKE '%rolled back%';
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: the notes say that the index was rolled back',
+        '0', v_cnt::text, v_cnt = 0);
+
+    ------------------------------------------------------------------
+    -- Nothing is left behind
+    ------------------------------------------------------------------
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: no index is left behind',
+        v_idx_before::text, v_idx_after::text, v_idx_before = v_idx_after);
+
+    -- The index the advisor proposes must not exist afterwards.
+    SELECT coalesce((regexp_match(change_sql,
+            'CREATE INDEX CONCURRENTLY ([a-z0-9_]+)'))[1], '')
+      INTO v_txt
+      FROM qa_report
+     WHERE change_type = 'CREATE_INDEX'
+     LIMIT 1;
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: the report names the index it would build',
+        '>=1', CASE WHEN v_txt <> '' THEN '1' ELSE '0' END, v_txt <> '');
+
+    SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = v_txt) INTO v_exists;
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: the proposed index does not exist afterwards',
+        'f', coalesce(v_exists::text, '-'), NOT v_exists);
+
+    ------------------------------------------------------------------
+    -- A single statement
+    ------------------------------------------------------------------
+    CREATE TEMP TABLE qa_report_one AS
+        SELECT * FROM sta.before_after_report(v_one_sql, 'window', 1, 5, false);
+
+    SELECT count(*) INTO v_cnt FROM qa_report_one;
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: a single statement is measured',
+        '>=1', v_cnt::text, v_cnt >= 1);
+
+    SELECT count(*) INTO v_cnt FROM qa_report_one
+     WHERE statement IS DISTINCT FROM v_one_sql;
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: the statement that was asked for is the one that is measured',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report_one
+     WHERE before_plan IS NULL OR after_plan IS NULL;
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: a single statement gets both plans',
+        '0', v_cnt::text, v_cnt = 0);
+
+    ------------------------------------------------------------------
+    -- The helpers
+    ------------------------------------------------------------------
+    v_txt := sta._explain_text_any(v_param_sql);
+    INSERT INTO qa_result VALUES (default,
+        '_explain_text_any: a statement with a placeholder gets a plan',
+        '>=1', CASE WHEN coalesce(v_txt, '') LIKE '%Scan%' THEN '1' ELSE '0' END,
+        coalesce(v_txt, '') LIKE '%Scan%');
+
+    SELECT * INTO v_m FROM sta._measure_plan_any(v_param_sql, 1);
+    INSERT INTO qa_result VALUES (default,
+        '_measure_plan_any: a statement with a placeholder is measured with its generic plan',
+        'ESTIMATED', coalesce(v_m.mode, '-'), v_m.mode = 'ESTIMATED');
+
+    INSERT INTO qa_result VALUES (default,
+        '_measure_plan_any: the generic plan has a cost',
+        '>=1', CASE WHEN coalesce(v_m.est_cost, 0) > 0 THEN '1' ELSE '0' END,
+        coalesce(v_m.est_cost, 0) > 0);
+
+    INSERT INTO qa_result VALUES (default,
+        '_measure_plan_any: the generic plan is shown',
+        '>=1', CASE WHEN coalesce(v_m.plan_text, '') LIKE '%Scan%' THEN '1' ELSE '0' END,
+        coalesce(v_m.plan_text, '') LIKE '%Scan%');
+
+    SELECT * INTO v_m FROM sta._measure_plan_any(v_one_sql, 1);
+    INSERT INTO qa_result VALUES (default,
+        '_measure_plan_any: a statement that can be run is measured',
+        'MEASURED', coalesce(v_m.mode, '-'), v_m.mode = 'MEASURED');
+
+    INSERT INTO qa_result VALUES (default,
+        '_measure_plan_any: the measured statement reports its time',
+        '>=1', CASE WHEN coalesce(v_m.avg_ms, 0) > 0 THEN '1' ELSE '0' END,
+        coalesce(v_m.avg_ms, 0) > 0);
+
+    SELECT * INTO v_m FROM sta._action_statement('window', 'big_events', 25);
+    INSERT INTO qa_result VALUES (default,
+        '_action_statement: the heaviest statement of the relation is found',
+        '1001', coalesce(v_m.queryid::text, '-'), v_m.queryid = 1001);
+
+    INSERT INTO qa_result VALUES (default,
+        '_action_statement: the time of that statement is reported',
+        '96000', coalesce(round(v_m.total_exec_time)::text, '-'),
+        round(v_m.total_exec_time) = 96000);
+
+    SELECT count(*) INTO v_cnt FROM sta._action_statement('window', 'unanalysed', 25);
+    INSERT INTO qa_result VALUES (default,
+        '_action_statement: a relation that no statement uses has no statement',
+        '0', v_cnt::text, v_cnt = 0);
+
+    ------------------------------------------------------------------
+    -- One statement against one change
+    ------------------------------------------------------------------
+    SELECT * INTO v_c FROM sta._measure_change(
+        v_one_sql,
+        'CREATE INDEX qa_ba15_fact_dim1 ON sta_qa.pa_fact (dim1_id)',
+        'CREATE_INDEX', 1);
+    INSERT INTO qa_result VALUES (default,
+        '_measure_change: the change changes the plan',
+        't', coalesce(v_c.plan_changed::text, '-'), v_c.plan_changed);
+
+    INSERT INTO qa_result VALUES (default,
+        '_measure_change: the notes say that the change was rolled back',
+        '>=1', CASE WHEN coalesce(array_to_string(v_c.notes, ' '), '') LIKE '%rolled back%'
+                    THEN '1' ELSE '0' END,
+        coalesce(array_to_string(v_c.notes, ' '), '') LIKE '%rolled back%');
+
+    SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'qa_ba15_fact_dim1')
+      INTO v_exists;
+    INSERT INTO qa_result VALUES (default,
+        '_measure_change: the index is rolled back',
+        'f', coalesce(v_exists::text, '-'), NOT v_exists);
+
+    ------------------------------------------------------------------
+    -- The action script
+    ------------------------------------------------------------------
+    v_script    := sta.action_script(NULL, 'window', false, 50, true, 1);
+    v_script_np := sta.action_script(NULL, 'window', false, 50, false, 1);
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the step carries the plan before the change',
+        '>=1', CASE WHEN v_script LIKE '%-- Plan before%' THEN '1' ELSE '0' END,
+        v_script LIKE '%-- Plan before%');
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the step carries the plan after the change',
+        '>=1', CASE WHEN v_script LIKE '%-- Plan after%' THEN '1' ELSE '0' END,
+        v_script LIKE '%-- Plan after%');
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the step carries the gain',
+        '>=1', CASE WHEN v_script LIKE '%-- Gain:%' THEN '1' ELSE '0' END,
+        v_script LIKE '%-- Gain:%');
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the step carries the verdict',
+        '>=1', CASE WHEN v_script LIKE '%-- Verdict:%' THEN '1' ELSE '0' END,
+        v_script LIKE '%-- Verdict:%');
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the step carries the changes of the plan',
+        '>=1', CASE WHEN v_script LIKE '%-- Plan changes:%' THEN '1' ELSE '0' END,
+        v_script LIKE '%-- Plan changes:%');
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the step says that nothing was left behind',
+        '>=1', CASE WHEN v_script LIKE '%rolled back%' THEN '1' ELSE '0' END,
+        v_script LIKE '%rolled back%');
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: without the plans the block is not there',
+        '0', CASE WHEN v_script_np LIKE '%-- Plan before%' THEN '1' ELSE '0' END,
+        v_script_np NOT LIKE '%-- Plan before%');
+END
+$$;
+
+-- -------------------------------------------------------------------------
 -- Final report
 -- -------------------------------------------------------------------------
 -- Emitted unaligned with '|' as the separator so that test/run_qa.sh can

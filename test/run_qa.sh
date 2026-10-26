@@ -64,7 +64,8 @@ if [ -f "$ROOT/scripts/lint_sql.py" ]; then
         "$ROOT/sql/pg_sta--$PG_STA_EXTVERSION.sql" \
         "$ROOT/sql/pg_sta--0.1.0--$PG_STA_EXTVERSION.sql" \
         "$ROOT/sql/pg_sta--0.1.1--$PG_STA_EXTVERSION.sql" \
-        "$ROOT/sql/pg_sta--0.1.2--$PG_STA_EXTVERSION.sql" 2>&1)
+        "$ROOT/sql/pg_sta--0.1.2--$PG_STA_EXTVERSION.sql" \
+        "$ROOT/sql/pg_sta--0.1.3--$PG_STA_EXTVERSION.sql" 2>&1)
     if [ $? -ne 0 ]; then
         echo "$LINT_OUT"
         echo "!! the extension scripts do not pass the linter"

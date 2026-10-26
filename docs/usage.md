@@ -33,6 +33,7 @@ only the extension interfaces PostgreSQL provides:
 | Did the change help, without regressions? | `sta.validate()` |
 | What does the plan look like before and after a change? | `sta.plan_before_after()` |
 | How much does the change actually gain me? | `sta.before_after_benefit()` |
+| What does the change do to every statement of the workload? | `sta.before_after_report()` |
 | What is the Oracle-style id of my statement? | `sta.sql_id()`, `sta.sql_hash()` |
 | What is the `pg_stat_statements` id of my statement? | `sta.queryid_info()` |
 
@@ -142,12 +143,12 @@ The developer scripts in `scripts/` do this automatically:
 | Path | Purpose |
 |---|---|
 | `src/pg_sta.c` | the C core: plan capture, query ids, server introspection |
-| `sql/pg_sta--0.1.3.sql` | the advisory engine, the catalogue and the sample tables |
+| `sql/pg_sta--0.1.4.sql` | the advisory engine, the catalogue and the sample tables |
 | `sql/pg_sta.sql` | the regression suite (pg_regress) |
 | `sql/sample_data.sql`, `sql/sample_workload.sql` | the demo schema and the demo workload |
 | `scripts/pg_sta_ctl` | the command line client |
 | `scripts/*.sh` | build, install, reload, sample-data and test helpers for the dev VM |
-| `test/qa_setup.sql`, `test/qa_assertions.sql` | the QA suite (162 assertions) |
+| `test/qa_setup.sql`, `test/qa_assertions.sql` | the QA suite (201 assertions) |
 | `docs/` | the operational and design documentation |
 | `packaging/pg_sta.spec` | an RPM spec file |
 
@@ -188,7 +189,7 @@ sudo make PG_CONFIG=/usr/pgsql-17/bin/pg_config install
 
 - `pg_sta.so` → `$(pg_config --pkglibdir)`
 - `pg_sta.control` → `$(pg_config --sharedir)/extension`
-- `pg_sta--0.1.3.sql` → `$(pg_config --sharedir)/extension`
+- `pg_sta--0.1.4.sql` → `$(pg_config --sharedir)/extension`
 
 ---
 
@@ -492,6 +493,51 @@ less /tmp/pg_sta_actions.sql          # read it first
 sudo -u postgres psql -X -v ON_ERROR_STOP=1 -d appdb -f /tmp/pg_sta_actions.sql
 ```
 
+The full signature is:
+
+```sql
+sta.action_script(
+    p_sql        text    DEFAULT NULL,     -- one statement, or NULL for the whole workload
+    p_window     text    DEFAULT 'window',  -- 'window', 'cumulative' or 'top'
+    p_analyze    boolean DEFAULT false,     -- run EXPLAIN (ANALYZE) on the statements
+    p_limit      integer DEFAULT 50,       -- how many statements the script covers
+    p_plans      boolean DEFAULT true,     -- carry the plan before and after every step
+    p_iterations integer DEFAULT 3)        -- how often each statement is measured
+```
+
+With `p_plans` — the default — every step of the script also carries the
+**plan before the change**, the **plan after it**, the **gain that was
+measured** and the **verdict**. The change is applied in a subtransaction
+and rolled back, so the script shows what the change *would* do without
+leaving anything behind in the database:
+
+```
+-- Plan before (generic plan, the statement could not be run):
+--   Gather  (cost=1000.00..16638.71 rows=5000 width=50)
+--     Workers Planned: 3
+--     ->  Parallel Seq Scan on customers  (cost=0.00..15138.71 rows=1613 width=50)
+--           Filter: (lower((customer_name)::text) = $1)
+--
+-- Plan after (generic plan, the statement could not be run):
+--   Bitmap Heap Scan on customers  (cost=61.17..4311.06 rows=5000 width=50)
+--     Recheck Cond: (lower((customer_name)::text) = $1)
+--     ->  Bitmap Index Scan on idx_customers_customer_name_lower  (cost=0.00..59.92 rows=5000 width=0)
+--           Index Cond: (lower((customer_name)::text) = $1)
+--
+-- Measured: estimated cost 16638.7 before, 4311.1 after
+-- Gain: 74.1%
+-- Verdict: RECOMMENDED
+-- Plan changes:
+--   -   Gather  ->  Bitmap Heap Scan on public.customers
+--   -   Seq Scan on public.customers  ->  Bitmap Index Scan using idx_customers_customer_name_lower
+-- Note: The change was applied in a subtransaction and rolled back; the database is unchanged.
+```
+
+A statement that comes from `pg_stat_statements` uses parameter
+placeholders (`$1`), so it cannot be run as it is. Its **generic plan**
+is shown instead, and the **estimated cost** is what is compared — the
+script says so in the header of the block.
+
 The script is **runnable as it is**:
 
 * every statement is terminated with `;`,
@@ -509,6 +555,13 @@ For one statement:
 ```sql
 SELECT sta.action_script(
     'SELECT * FROM orders WHERE customer_id NOT IN (SELECT customer_id FROM customers)');
+```
+
+To get the script without the plan blocks — the plan of every statement
+is measured, which takes time:
+
+```sql
+SELECT sta.action_script(NULL, 'cumulative', false, 100, false);
 ```
 
 ### 6.11 Rewritten statements
@@ -673,6 +726,70 @@ Two restrictions apply:
 | `NOT_COMPARABLE` | The two runs returned a different number of rows. |
 | `ERROR` | The statement or the change failed; see `notes`. |
 
+### 7.5 The before/after report for the whole workload
+
+`sta.plan_before_after()` measures **one** statement against **one**
+change. `sta.before_after_report()` does the same for **every statement of
+the workload**: it takes the changes the advisor recommends — the index,
+the rewrite and the statistics — measures each one and reports the plan
+before, the plan after and the benefit.
+
+```sql
+SELECT report_id, relation, change_type, measurement,
+       improvement_pct, verdict, plan_changed, rows_match
+FROM   sta.before_after_report(
+           p_sql        => NULL,          -- NULL: the whole workload
+           p_window     => 'window',
+           p_iterations => 3,
+           p_limit      => 10,            -- how many statements
+           p_statistics => true);         -- include the statistics changes
+```
+
+```
+ report_id |   relation   | change_type  | measurement | improvement_pct | verdict   | plan_changed | rows_match
+-----------+--------------+--------------+-------------+-----------------+-----------+--------------+------------
+         1 | orders       | REWRITE      | ESTIMATED   |          -24.2  | REJECTED  | t            | t
+         2 | public.customers | CREATE_INDEX | ESTIMATED |          74.1  | RECOMMENDED | t          | t
+         3 | customers    | REWRITE      | ESTIMATED   |             29.3 | RECOMMENDED | t         | t
+         4 | big_events   | NONE         | MEASURED    |                - | NOT_USED  | f            | t
+```
+
+Every row carries the two plans in full:
+
+```sql
+SELECT report_id, before_plan, after_plan, node_changes, notes
+FROM   sta.before_after_report(NULL, 'window', 3, 10, true);
+```
+
+| Column | What it holds |
+|---|---|
+| `report_id` | the row number of the report |
+| `queryid` | the id of the statement the change belongs to |
+| `statement` | the statement, as the application writes it |
+| `relation` | the relation the change touches |
+| `change_type` | `CREATE_INDEX`, `REWRITE`, `ANALYZE`, `VACUUM_ANALYZE` or `NONE` |
+| `change_sql` | the change, as a runnable statement |
+| `measurement` | `MEASURED` when the statement was run, `ESTIMATED` when only the generic plan could be compared |
+| `before_plan`, `after_plan` | the two plans, in full |
+| `before_ms`, `after_ms` | the measured times (empty when only the cost could be compared) |
+| `before_cost`, `after_cost` | the estimated costs of the two plans |
+| `improvement_pct` | the gain in percent, positive when the change is faster |
+| `before_buffers`, `after_buffers` | the shared buffer hits and reads of the two runs |
+| `plan_changed` | whether the plan changed at all |
+| `rows_match` | whether the two runs returned the same rows |
+| `verdict` | one of the verdicts of §7.4 |
+| `node_changes` | the plan change matrix, node by node |
+| `notes` | what was done, and what could not be measured |
+
+**Every change is rolled back.** The index is created in a subtransaction,
+the plan is measured and the subtransaction is rolled back, so the
+database is exactly as it was. The report can be run on a production
+database.
+
+A statement that no change applies to still gets a row, with the change
+type `NONE` and the verdict `NOT_USED`: the report covers the whole
+workload, not only the statements that can be improved.
+
 ---
 
 ## 8. Statement identifiers, the Oracle way
@@ -798,6 +915,13 @@ The verdict is one of:
     "SELECT * FROM order_details WHERE order_id = 500000" \
     "CREATE INDEX idx_od_order_id ON order_details (order_id)"
 
+# the plan before and after the change, for every statement of the workload
+./scripts/pg_sta_ctl -d appdb --statements 5 before-after-report
+
+# the whole plan as one script, with the plan before and after every step
+./scripts/pg_sta_ctl -d appdb --statements 5 script --plans > fix.sql
+./scripts/pg_sta_ctl -d appdb --statements 5 script --no-plans > fix.sql
+
 # the identifiers of a statement, the Oracle way
 ./scripts/pg_sta_ctl -d appdb sqlid "SELECT * FROM orders WHERE customer_id = 42"
 ```
@@ -860,7 +984,10 @@ pg_sta_ctl: the pg_sta extension is not installed in database 'appdb'.
 | `stats [SCHEMA]` | statistics findings |
 | `index SQL` | index candidates for one statement |
 | `validate DDL SQL` | measure a proposed index against the current plan |
+| `actions [SQL]` | the action plan: every recommended change as a runnable statement |
+| `script [SQL]` | the whole plan as one commented, runnable file (`--plans` / `--no-plans`) |
 | `before-after SQL [CHANGE]` | the plan before and after a change, and the benefit of the change |
+| `before-after-report [SQL]` | the plan before and after the change, for every statement of the workload |
 | `queryid SQL` | the canonical query id and its normalised text |
 | `sqlid SQL` | every identifier of a statement: query id, SQL id, SQL hash |
 | `explain SQL` | the execution plan as JSON |
@@ -977,6 +1104,81 @@ repeating the advice string:
 The same operations from SQL are described in
 [pg19-compatibility.md](pg19-compatibility.md).
 
+### 10.4 The before/after report for the whole workload, from the command line
+
+`before-after-report` measures every recommended change against the
+statement it belongs to and prints the plan before, the plan after and
+the benefit:
+
+```console
+$ ./scripts/pg_sta_ctl -d appdb --statements 3 before-after-report
+pg_sta: the plan before and after the change, for every statement
+database: appdb
+window:   window
+
+
+--- 1. orders ---
+statement:    SELECT * FROM orders
+ WHERE customer_id NOT IN (SELECT customer_id FROM customers WHERE email LIKE $1)
+change type:  REWRITE
+change:       SELECT order_id,
+       customer_id,
+       order_date
+FROM orders
+WHERE NOT EXISTS (SELECT 1 FROM customers WHERE email LIKE $1 AND customers.customer_id = orders.customer_id)
+measured:     ESTIMATED
+
+--- PLAN BEFORE --------------------------------------------
+Seq Scan on orders  (cost=15844.76..34714.76 rows=500000 width=24)
+  Filter: (NOT (ANY (customer_id = (hashed SubPlan 1).col1)))
+  SubPlan 1
+    ->  Gather  (cost=1000.00..15832.26 rows=5000 width=8)
+          Workers Planned: 3
+          ->  Parallel Seq Scan on customers  (cost=0.00..14332.26 rows=1613 width=8)
+                Filter: ((email)::text ~~ $1)
+
+--- PLAN AFTER ---------------------------------------------
+Merge Anti Join  (cost=16139.88..43104.48 rows=995000 width=24)
+  Merge Cond: (orders.customer_id = customers.customer_id)
+  ->  Index Scan using idx_orders_customer_id on orders  (cost=0.42..24390.03 rows=1000000 width=24)
+  ->  Sort  (cost=16139.45..16151.95 rows=5000 width=8)
+        Sort Key: customers.customer_id
+        ->  Gather  (cost=1000.00..15832.26 rows=5000 width=8)
+              Workers Planned: 3
+              ->  Parallel Seq Scan on customers  (cost=0.00..14332.26 rows=1613 width=8)
+                    Filter: ((email)::text ~~ $1)
+
+--- benefit -----------------------------------------------
+before:       - ms
+after:        - ms
+cost:         34714.8 -> 43104.5
+gain:         -24.2 %
+plan changed: true
+rows match:   true
+verdict:      REJECTED
+plan changes:
+  Seq Scan on public.orders  ->  Merge Join
+  Gather  ->  Index Scan on public.orders using idx_orders_customer_id
+  Seq Scan on public.customers  ->  Sort
+  (added)  Gather
+  (added)  Seq Scan on public.customers
+notes:
+The change is the rewritten statement, so the "after" plan is the plan of the new text.
+```
+
+The report is **read-only in effect**: every change is applied in a
+subtransaction and rolled back, so nothing is left behind in the
+database. The times are empty and the verdict comes from the estimated
+cost when the statement uses parameter placeholders (`$1`) and cannot be
+run — the measurement then says `ESTIMATED` instead of `MEASURED`.
+
+| Flag | Meaning |
+|---|---|
+| `--statements N` | how many statements of the workload the report covers (default 10) |
+| `--iterations N` | how often each statement is measured (default 3) |
+| `--window W` | `window`, `cumulative` or `top` |
+| `--no-plans` | skip the plan blocks; only the summary is printed |
+
 Connection settings come from the environment:
 
 | Variable | Default | Meaning |
@@ -1026,7 +1228,7 @@ UPDATE sta.threshold SET value = 0.05 WHERE name = 'dead_tuple_ratio';
 To restore the defaults, re-run the extension script:
 
 ```sql
-\i /usr/pgsql-17/share/extension/pg_sta--0.1.3.sql
+\i /usr/pgsql-17/share/extension/pg_sta--0.1.4.sql
 ```
 
 ### 11.1 Server settings

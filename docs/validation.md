@@ -224,6 +224,54 @@ the same thing:
 | `NOT_COMPARABLE` | The two sides returned a different number of rows. |
 | `ERROR` | The statement or the change failed; see `notes`. |
 
+### 2a.4 `sta.before_after_report()` — the report for the whole workload
+
+`sta.plan_before_after()` measures **one** statement against **one**
+change. `sta.before_after_report()` does that for **every statement of
+the workload**, using the changes the advisor recommends:
+
+```sql
+SELECT * FROM sta.before_after_report(
+    p_sql        => NULL,        -- NULL: the whole workload
+    p_window     => 'window',
+    p_iterations => 3,
+    p_limit      => 10,
+    p_statistics => true);
+```
+
+| Argument | Type | Meaning |
+|---|---|---|
+| `p_sql` | `text` | one statement, or `NULL` for the whole workload |
+| `p_window` | `text` | `window`, `cumulative` or `top` |
+| `p_iterations` | `integer` | how many times each statement is measured (1–20, default 3) |
+| `p_limit` | `integer` | how many statements the report covers (1–50, default 10) |
+| `p_statistics` | `boolean` | include the `ANALYZE` / `VACUUM` changes |
+
+It returns **one row per (statement, change)**. A statement that no
+change applies to still gets a row, with the change type `NONE` and the
+verdict `NOT_USED` — the report covers the workload, not only the
+statements that can be improved.
+
+The rollback guarantee is the same: every index is created in a
+subtransaction, the plan is measured and the subtransaction is rolled
+back, so the report can be run on a production database.
+
+Two cases cannot be measured by running the statement, and the report
+says so in the `measurement` column:
+
+| `measurement` | Meaning |
+|---|---|
+| `MEASURED` | the statement was run; the times and the buffer counts are real |
+| `ESTIMATED` | the statement uses parameter placeholders and could not be run; the generic plan was compared and the **estimated cost** is what the verdict is based on |
+
+The `notes` column carries the reason in prose, for example:
+
+```
+The change is the rewritten statement, so the "after" plan is the plan of the new text.
+The change was applied in a subtransaction and rolled back; the database is unchanged.
+The plan before and after could not be measured: the statement this change belongs to was not found in the workload.
+```
+
 ---
 
 ## 3. The verdicts

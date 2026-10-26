@@ -232,12 +232,12 @@ accepts an improvement.
 The QA suite:
 
 1. creates the fixture `sta_qa` with deliberate defects,
-2. evaluates 162 assertions in `test/qa_assertions.sql`,
+2. evaluates 201 assertions in `test/qa_assertions.sql`,
 3. prints a pass/fail line per assertion and a summary.
 
 ```
 --------------------------------------------------------
-total=89 passed=89 failed=0
+total=201 passed=201 failed=0
 ==> QA PASSED
 ```
 
@@ -278,6 +278,7 @@ runner's parser.
 | `sta_qa.big_events` | 120 000 rows, a hot query with no supporting index |
 | `sta_qa.hot_path` | 200 rows, executed very often |
 | `sta_qa.lookup` | 200 rows, a selective predicate |
+| `sta_qa.pa_fact`, `sta_qa.pa_dim1`, `sta_qa.pa_dim2` | the fact/dimension tables the plan-advice assertions plan against |
 
 ---
 
@@ -317,7 +318,7 @@ The rules that keep them safe:
 
 ## 9. Adding a new finding
 
-1. Add the rule to the relevant advice function in `sql/pg_sta--0.1.3.sql`.
+1. Add the rule to the relevant advice function in `sql/pg_sta--0.1.4.sql`.
 2. Add the row to the `sta.advice_catalog` table in the same file — the
    severity of a finding should come from the catalogue, not from a
    literal in the function body.

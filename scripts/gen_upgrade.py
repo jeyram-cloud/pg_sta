@@ -62,6 +62,19 @@ CHANGED = [
     "sta.sql_id",
     "sta.sql_hash",
     "sta.queryid_info",
+    "sta._explain_text_any",
+    "sta._measure_plan_any",
+    "sta._action_statement",
+    "sta._measure_change",
+    "sta.before_after_report",
+]
+
+# The functions whose signature changed.  CREATE OR REPLACE cannot change a
+# signature, so the old version is dropped first.  Without the drop both
+# versions would stay in the database and every call without arguments
+# would be ambiguous.
+DROPPED = [
+    "sta.action_script(text, text, boolean, integer)",
 ]
 
 # The tables that are new in the new version.  The upgrade creates them
@@ -159,6 +172,9 @@ def main():
     for name in TABLES:
         parts.append("")
         parts.append(extract_table(src, name))
+    for name in DROPPED:
+        parts.append("")
+        parts.append("DROP FUNCTION IF EXISTS %s;" % name)
     for name in CHANGED:
         parts.append("")
         parts.append(extract_function(src, name))

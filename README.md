@@ -47,6 +47,7 @@ cannot be validated is not a recommendation.
 | **Rewrites** | `sta.rewrite_statement()` applies every rewrite rule to a statement at once and returns the complete, formatted SQL — `NOT IN` → `NOT EXISTS`, `OR` → `IN`, `col::text` → `col`, `OFFSET` → keyset pagination, `SELECT *` → the real columns |
 | **Validation** | `sta.validate()` measures a candidate index against the current plan in a rolled-back subtransaction and returns a verdict |
 | **Before / after** | `sta.plan_before_after()` shows the plan of a statement **before** a change and **after** it, with the times and the buffer counts of both; `sta.before_after_benefit()` adds the benefit, the verdict and the plan change matrix |
+| **Before / after report** | `sta.before_after_report()` measures **every** recommended change against the statement it belongs to and returns the plan before, the plan after and the gain — for the whole workload, with every change rolled back |
 | **Statement ids** | `sta.sql_id()` and `sta.sql_hash()` give the Oracle-style `SQL_ID` and `SQL_HASH`; `sta.queryid_info()` gives the `pg_stat_statements` query id, the normalised text and the workload of the statement |
 | **Explainability** | Every finding carries structured `evidence` (JSONB), not just prose |
 | **Calibratable** | All 16 decision thresholds live in `sta.threshold` and can be tuned without recompiling |
@@ -108,6 +109,12 @@ sudo -u postgres psql -X -d appdb -c "
       'SELECT * FROM order_details WHERE order_id = 500000',
       'CREATE INDEX idx_od_order_id ON order_details (order_id)');"
 
+# 4d2. the plan before and after the change, for every statement of the workload
+sudo -u postgres psql -X -d appdb -c "
+  SELECT report_id, relation, change_type, measurement,
+         improvement_pct, verdict
+  FROM sta.before_after_report(NULL, 'window', 3, 10, true);"
+
 # 4e. the Oracle-style identifiers of a statement
 sudo -u postgres psql -X -d appdb -c "
   SELECT * FROM sta.queryid_info('SELECT * FROM orders WHERE customer_id = 42');"
@@ -131,6 +138,9 @@ Or from the command line:
 ./scripts/pg_sta_ctl --database appdb before-after \
     "SELECT * FROM order_details WHERE order_id = 500000" \
     "CREATE INDEX idx_od_order_id ON order_details (order_id)"
+
+# the plan before and after the change, for every statement of the workload
+./scripts/pg_sta_ctl --database appdb --statements 5 before-after-report
 
 # the identifiers of a statement, the Oracle way
 ./scripts/pg_sta_ctl --database appdb sqlid "SELECT * FROM orders WHERE customer_id = 42"
@@ -337,6 +347,50 @@ the rewritten statement; `AUTO` detects which one it is. A change that
 makes the query **slower** is reported as `REJECTED`, so a bad index
 candidate cannot be mistaken for a good one.
 
+### The report for the whole workload
+
+`sta.before_after_report()` does the same for **every statement of the
+workload**: it takes the changes the advisor recommends — the index, the
+rewrite and the statistics — measures each one and returns the plan
+before, the plan after and the benefit.
+
+```sql
+SELECT report_id, relation, change_type, measurement,
+       improvement_pct, verdict, plan_changed, rows_match
+FROM sta.before_after_report(NULL, 'window', 3, 10, true);
+```
+
+```
+ report_id |   relation    | change_type  | measurement | improvement_pct | verdict     | plan_changed | rows_match
+-----------+---------------+--------------+-------------+-----------------+-------------+--------------+------------
+         1 | orders        | REWRITE      | ESTIMATED   |          -24.2  | REJECTED    | t            | t
+         2 | public.customers | CREATE_INDEX | ESTIMATED |          74.1  | RECOMMENDED | t            | t
+         3 | customers     | REWRITE      | ESTIMATED   |             29.3 | RECOMMENDED | t            | t
+```
+
+Every row carries the two plans in full, in `before_plan` and
+`after_plan`. Every change is **rolled back**, so the report can be run
+on a production database and nothing is left behind.
+
+The same report, with the plans printed, from the command line:
+
+```console
+$ ./scripts/pg_sta_ctl --database appdb --statements 3 before-after-report
+```
+
+A statement that uses parameter placeholders (`$1`) cannot be run as it
+is; its generic plan is shown instead and the **estimated cost** is what
+is compared — the report says `ESTIMATED` instead of `MEASURED`.
+
+`sta.action_script()` carries the same information: with `p_plans` (the
+default) every step of the script holds the plan before the change, the
+plan after it, the measured gain and the verdict:
+
+```console
+$ ./scripts/pg_sta_ctl --database appdb --statements 3 script --plans > fix.sql
+$ ./scripts/pg_sta_ctl --database appdb --statements 3 script --no-plans > fix.sql
+```
+
 ## Statement identifiers, the Oracle way
 
 Oracle gives every statement a `V$SQL.SQL_ID` (a hash of the **exact**
@@ -417,7 +471,7 @@ pg_sta: 38 finding(s)
       │
       ▼
   ┌───────────────────────────────────────────────────────────┐
-  │  SQL advisory layer (sql/pg_sta--0.1.3.sql)               │
+  │  SQL advisory layer (sql/pg_sta--0.1.4.sql)               │
   │    workload_advice()  plan_advice()  stats_advice()      │
   │    index_advice()     validate()     recommendations()   │
   │    action_plan()      action_script()                    │
@@ -462,10 +516,11 @@ pg_sta/
 ├── pg_sta.control           extension control file
 ├── src/pg_sta.c             C core: queryid, normalisation, EXPLAIN, server info
 ├── sql/
-│   ├── pg_sta--0.1.3.sql    the advisory engine (schema "sta")
-│   ├── pg_sta--0.1.0--0.1.3.sql   upgrade path from 0.1.0
-│   ├── pg_sta--0.1.1--0.1.3.sql   upgrade path from 0.1.1
-│   ├── pg_sta--0.1.2--0.1.3.sql   upgrade path from 0.1.2
+│   ├── pg_sta--0.1.4.sql    the advisory engine (schema "sta")
+│   ├── pg_sta--0.1.0--0.1.4.sql   upgrade path from 0.1.0
+│   ├── pg_sta--0.1.1--0.1.4.sql   upgrade path from 0.1.1
+│   ├── pg_sta--0.1.2--0.1.4.sql   upgrade path from 0.1.2
+│   ├── pg_sta--0.1.3--0.1.4.sql   upgrade path from 0.1.3
 │   ├── pg_sta.sql           regression test
 │   ├── orders_workload.sql  a 10-statement workload for the demo schema
 │   ├── sample_data.sql      demo schema: orders, customers, workload
@@ -486,7 +541,7 @@ pg_sta/
 │   └── installcheck.sh      run the regression suite
 ├── test/
 │   ├── qa_setup.sql         deliberate-defect fixture, split into phases
-│   ├── qa_assertions.sql    162 assertions
+│   ├── qa_assertions.sql    201 assertions
 │   └── run_qa.sh            the QA runner
 ├── packaging/pg_sta.spec    RPM package
 └── docs/                    the documentation set
@@ -498,7 +553,7 @@ pg_sta/
 
 ```bash
 make installcheck PG_CONFIG=/usr/pgsql-17/bin/pg_config   # regression suite
-make qa                                                     # QA suite (162 assertions)
+make qa                                                     # QA suite (201 assertions)
 ```
 
 The QA suite seeds a database with **deliberate defects** — an unanalysed

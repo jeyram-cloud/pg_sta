@@ -34,10 +34,15 @@
 #   index SQL                index candidates for one statement
 #   rewrite SQL              SQL rewrite candidates for one statement
 #   actions [SQL]            the action plan: DDL, VACUUM/ANALYZE and rewrites
-#   script [SQL]             the action plan as a runnable SQL script
+#   script [SQL]             the action plan as a runnable SQL script, with
+#                            the plan before and after every step
 #   before-after SQL [CHANGE]
 #                            the plan before and after a change, and the
 #                            benefit of the change (the change is rolled back)
+#   before-after-report [SQL]
+#                            the plan before and after the change for every
+#                            statement of the workload, with the benefit of
+#                            every change
 #   validate DDL SQL         measure a proposed index against the current plan
 #   queryid SQL              the canonical query id of a statement
 #   sqlid SQL                every identifier of a statement, the Oracle way
@@ -72,6 +77,8 @@
 #   pg_sta_ctl --database appdb index "SELECT * FROM orders WHERE customer_id = 42"
 #   pg_sta_ctl --database appdb actions "SELECT * FROM orders WHERE customer_id = 42"
 #   pg_sta_ctl --database appdb script "SELECT * FROM orders WHERE customer_id = 42" > fix.sql
+#   pg_sta_ctl --database appdb script --no-plans > fix.sql
+#   pg_sta_ctl --database appdb --statements 5 before-after-report
 #   pg_sta_ctl --database appdb before-after \
 #       "SELECT * FROM orders WHERE customer_id = 42" \
 #       "CREATE INDEX idx_orders_customer ON orders (customer_id)"
@@ -97,9 +104,11 @@ ROOT=$(cd "$HERE/.." && pwd)
 DB="$PG_STA_PGDATABASE"
 OUTPUT=text
 LIMIT=50
+STATEMENTS=10
 WINDOW=window
 ITERATIONS=3
 ANALYZE=false
+PLANS=true
 SQL_ARG=""
 DDL_ARG=""
 CHANGE_ARG=""
@@ -129,9 +138,12 @@ while [ $# -gt 0 ]; do
         --ssh)         PG_STA_MODE=ssh; shift ;;
         -o|--output)   OUTPUT="$2"; shift 2 ;;
         --limit)       LIMIT="$2"; shift 2 ;;
+        --statements)  STATEMENTS="$2"; shift 2 ;;
         --window)      WINDOW="$2"; shift 2 ;;
         --iterations)  ITERATIONS="$2"; shift 2 ;;
         --analyze)     ANALYZE=true; shift ;;
+        --plans)       PLANS=true; shift ;;
+        --no-plans)    PLANS=false; shift ;;
         -h|--help)     usage; exit 0 ;;
         --)            shift; break ;;
         -*)            die "unknown option: $1" ;;
@@ -189,9 +201,25 @@ case "$COMMAND" in
     record)
         if [ $# -ge 1 ]; then SCOPE_ARG="$1"; shift; fi
         if [ $# -ge 1 ]; then TARGET_ARG="$1"; shift; fi ;;
-    actions|script)
+    actions|script|before-after-report)
         # The statement is optional: without it the action plan is built
-        # from the statements of the workload.
+        # from the statements of the workload.  The options may also
+        # follow the command, so they are read here as well.  Only the
+        # options that are known are read as options, so a statement that
+        # starts with a dash is still taken as a statement.
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --limit)       LIMIT="$2"; shift 2 ;;
+                --statements)  STATEMENTS="$2"; shift 2 ;;
+                --window)      WINDOW="$2"; shift 2 ;;
+                --iterations)  ITERATIONS="$2"; shift 2 ;;
+                --analyze)     ANALYZE=true; shift ;;
+                --plans)       PLANS=true; shift ;;
+                --no-plans)    PLANS=false; shift ;;
+                -o|--output)   OUTPUT="$2"; shift 2 ;;
+                *)             break ;;
+            esac
+        done
         if [ $# -ge 1 ]; then SQL_ARG="$1"; shift; fi ;;
     collect|reset|workload|catalog|server-info|install|regress|qa|upgrade) ;;
     load-sample-data)
@@ -534,7 +562,49 @@ script)
         lit="NULL"
     fi
     cat <<SQL | run_sql "-q -A -t"
-SELECT sta.action_script($lit, '$WINDOW', $ANALYZE, $LIMIT);
+SELECT sta.action_script($lit, '$WINDOW', $ANALYZE, $LIMIT, $PLANS, $ITERATIONS);
+SQL
+    ;;
+
+before-after-report)
+    # The plan before and after the change for every statement of the
+    # workload, with the benefit of the change.  Every change is rolled
+    # back: nothing is left behind in the database.
+    if [ -n "$SQL_ARG" ]; then
+        lit=$(sql_literal "$SQL_ARG")
+    else
+        lit="NULL"
+    fi
+    cat <<SQL | run_sql "-q -A -t"
+SELECT 'pg_sta: the plan before and after the change, for every statement' || E'\n' ||
+       'database: ' || current_database() || E'\n' ||
+       'window:   ' || '$WINDOW' || E'\n\n' ||
+       coalesce(string_agg(
+           E'\n--- ' || r.report_id || '. ' ||
+              coalesce(nullif(r.relation, ''), r.change_type) || ' ---' || E'\n' ||
+           'statement:    ' || r.statement || E'\n' ||
+           'change type:  ' || r.change_type || E'\n' ||
+           'change:       ' || coalesce(r.change_sql, '(none)') || E'\n' ||
+           'measured:     ' || r.measurement || E'\n' ||
+           E'\n--- PLAN BEFORE --------------------------------------------\n' ||
+           coalesce(r.before_plan, '(no plan)') || E'\n' ||
+           E'--- PLAN AFTER ---------------------------------------------\n' ||
+           coalesce(r.after_plan, '(no plan)') || E'\n' ||
+           E'--- benefit -----------------------------------------------\n' ||
+           'before:       ' || coalesce(round(r.before_ms::numeric, 3)::text, '-') || ' ms' || E'\n' ||
+           'after:        ' || coalesce(round(r.after_ms::numeric, 3)::text, '-') || ' ms' || E'\n' ||
+           'cost:         ' || coalesce(round(r.before_cost::numeric, 1)::text, '-') || ' -> ' ||
+                            coalesce(round(r.after_cost::numeric, 1)::text, '-') || E'\n' ||
+           'gain:         ' || coalesce(round(r.improvement_pct::numeric, 1)::text, '-') || ' %' || E'\n' ||
+           'plan changed: ' || r.plan_changed::text || E'\n' ||
+           'rows match:   ' || r.rows_match::text || E'\n' ||
+           'verdict:      ' || r.verdict || E'\n' ||
+           'plan changes:' || E'\n' ||
+           coalesce(array_to_string(r.node_changes, E'\n'), '(none)') || E'\n' ||
+           'notes:' || E'\n' ||
+           coalesce(array_to_string(r.notes, E'\n'), '(none)'),
+           E'\n'), '')
+FROM sta.before_after_report($lit, '$WINDOW', $ITERATIONS, $STATEMENTS, true) r;
 SQL
     ;;
 

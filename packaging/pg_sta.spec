@@ -2,7 +2,7 @@
 %global pgversion 17
 
 Name:           pg_sta
-Version:        0.1.3
+Version:        0.1.4
 Release:        1%{?dist}
 Summary:        PostgreSQL SQL Tuning Advisor
 
@@ -54,10 +54,11 @@ make install DESTDIR=%{buildroot} PG_CONFIG=/usr/pgsql-%{pgversion}/bin/pg_confi
 %files
 %{_libdir}/pg_sta.so
 %{_datadir}/pgsql/extension/pg_sta.control
-%{_datadir}/pgsql/extension/pg_sta--0.1.3.sql
-%{_datadir}/pgsql/extension/pg_sta--0.1.0--0.1.3.sql
-%{_datadir}/pgsql/extension/pg_sta--0.1.1--0.1.3.sql
-%{_datadir}/pgsql/extension/pg_sta--0.1.2--0.1.3.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.4.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.0--0.1.4.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.1--0.1.4.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.2--0.1.4.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.3--0.1.4.sql
 %{_datadir}/pgsql/extension/pg_sta--0.1.0--0.1.1.sql
 %license LICENSE
 %doc README.md
@@ -66,6 +67,13 @@ make install DESTDIR=%{buildroot} PG_CONFIG=/usr/pgsql-%{pgversion}/bin/pg_confi
 %doc docs/pg19-compatibility.md
 
 %changelog
+* Sun Oct 26 2026 Jey <jey@example.com> - 0.1.4-1
+- The plan before and after the change, for every statement of the
+  workload: sta.before_after_report() measures every change the advisor
+  recommends and returns the plan before, the plan after and the gain.
+- The action script now carries the plan before and the plan after every
+  step, with the measured benefit and a verdict.
+
 * Sun Oct 25 2026 Jey <jey@example.com> - 0.1.3-1
 - The plan before and after a change: sta.plan_before_after() measures the
   plan of a statement before and after an index, an ANALYZE or a rewritten
