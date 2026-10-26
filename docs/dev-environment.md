@@ -232,12 +232,12 @@ accepts an improvement.
 The QA suite:
 
 1. creates the fixture `sta_qa` with deliberate defects,
-2. evaluates 201 assertions in `test/qa_assertions.sql`,
+2. evaluates 204 assertions in `test/qa_assertions.sql`,
 3. prints a pass/fail line per assertion and a summary.
 
 ```
 --------------------------------------------------------
-total=201 passed=201 failed=0
+total=204 passed=204 failed=0
 ==> QA PASSED
 ```
 

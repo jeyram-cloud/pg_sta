@@ -265,17 +265,58 @@ pg_sta_parse_one(const char *sql, const char *caller)
 	 * parser, which infers the type of every parameter from its context.
 	 * Everything else goes through the fixed-parameter parser, which is
 	 * what pg_stat_statements effectively sees.
+	 *
+	 * The analyzer resolves every relation of the statement, so a
+	 * statement that refers to a relation the current database does not
+	 * hold fails here.  That is a common mistake -- the advisor is
+	 * usually run against the database of the workload, and a statement
+	 * of another database cannot be planned there -- so the error says
+	 * which function was called and which database is connected to,
+	 * instead of only repeating "relation does not exist".
 	 */
-	if (pg_sta_scan_params(stmt->sql) > 0)
+	PG_TRY();
 	{
-		Oid		   *paramTypes = NULL;
-		int			numParams = 0;
+		if (pg_sta_scan_params(stmt->sql) > 0)
+		{
+			Oid		   *paramTypes = NULL;
+			int			numParams = 0;
 
-		stmt->query = parse_analyze_varparams(stmt->raw, stmt->sql,
-											  &paramTypes, &numParams, NULL);
+			stmt->query = parse_analyze_varparams(stmt->raw, stmt->sql,
+												  &paramTypes, &numParams, NULL);
+		}
+		else
+			stmt->query = parse_analyze_fixedparams(stmt->raw, stmt->sql, NULL, 0, NULL);
 	}
-	else
-		stmt->query = parse_analyze_fixedparams(stmt->raw, stmt->sql, NULL, 0, NULL);
+	PG_CATCH();
+	{
+		ErrorData  *edata = CopyErrorData();
+		int			code = edata->sqlerrcode;
+		/*
+		 * Copy the message out of the error state before the state is
+		 * flushed: CopyErrorData() allocates in the error context, and
+		 * FlushErrorState() resets it.
+		 */
+		char	   *orig = pstrdup(edata->message ? edata->message : "(no message)");
+		const char *dbname;
+
+		if (code == ERRCODE_UNDEFINED_TABLE ||
+			code == ERRCODE_UNDEFINED_COLUMN)
+		{
+			dbname = get_database_name(MyDatabaseId);
+
+			FlushErrorState();
+
+			ereport(ERROR,
+					(errcode(code),
+					 errmsg("%s: the statement refers to a relation or a column that does not exist here", caller),
+					 errdetail("The server reported: %s", orig),
+					 errhint("Check that the statement is meant for this database: current_database() is \"%s\".",
+							 dbname ? dbname : "(unknown)")));
+		}
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	return stmt;
 }

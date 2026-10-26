@@ -1944,6 +1944,51 @@ END
 $$;
 
 -- -------------------------------------------------------------------------
+-- 16. The error message for a statement that names a missing relation
+-- -------------------------------------------------------------------------
+-- The advisor is usually run against the database of the workload.  A
+-- statement of another database cannot be planned there, and the plain
+-- "relation does not exist" does not say which function was called or
+-- which database is connected to.  The error must say both.
+DO $$
+DECLARE
+    v_msg  text;
+    v_hint text;
+    v_detail text;
+BEGIN
+    BEGIN
+        PERFORM sta.sql_hash('SELECT * FROM qa_relation_that_does_not_exist');
+        v_msg   := 'no error';
+        v_hint  := 'no hint';
+        v_detail := 'no detail';
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS
+            v_msg    = MESSAGE_TEXT,
+            v_hint   = PG_EXCEPTION_HINT,
+            v_detail = PG_EXCEPTION_DETAIL;
+    END;
+
+    INSERT INTO qa_result VALUES (default,
+        'a missing relation: the error names the caller',
+        'sta.%: the statement refers to a relation or a column that does not exist here',
+        coalesce(v_msg, '(none)'),
+        coalesce(v_msg, '') LIKE 'sta.%: the statement refers to a relation or a column that does not exist here');
+
+    INSERT INTO qa_result VALUES (default,
+        'a missing relation: the error says which database is connected to',
+        'current_database()',
+        coalesce(v_hint, '(none)'),
+        coalesce(v_hint, '') LIKE '%current_database()%');
+
+    INSERT INTO qa_result VALUES (default,
+        'a missing relation: the error repeats what the server reported',
+        'the relation that does not exist',
+        coalesce(v_detail, '(none)'),
+        coalesce(v_detail, '') LIKE '%does not exist%');
+END
+$$;
+
+-- -------------------------------------------------------------------------
 -- Final report
 -- -------------------------------------------------------------------------
 -- Emitted unaligned with '|' as the separator so that test/run_qa.sh can

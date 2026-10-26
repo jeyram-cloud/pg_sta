@@ -450,7 +450,7 @@ when the output differs. This catches *behavioural* changes.
 | `sta_qa.big_events` | 120 000 rows, hot query, no supporting index | `SEQ_SCAN_ON_LARGE_TABLE` |
 | `sta_qa.hot_path` | very high call count | `HIGH_FREQUENCY` |
 
-`test/qa_assertions.sql` contains 201 assertions in a machine-readable
+`test/qa_assertions.sql` contains 204 assertions in a machine-readable
 `assertion | expected | actual | passed` form. `test/run_qa.sh` runs the
 setup, then evaluates the assertions and reports the pass count.
 

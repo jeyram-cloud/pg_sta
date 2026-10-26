@@ -148,7 +148,7 @@ The developer scripts in `scripts/` do this automatically:
 | `sql/sample_data.sql`, `sql/sample_workload.sql` | the demo schema and the demo workload |
 | `scripts/pg_sta_ctl` | the command line client |
 | `scripts/*.sh` | build, install, reload, sample-data and test helpers for the dev VM |
-| `test/qa_setup.sql`, `test/qa_assertions.sql` | the QA suite (201 assertions) |
+| `test/qa_setup.sql`, `test/qa_assertions.sql` | the QA suite (204 assertions) |
 | `docs/` | the operational and design documentation |
 | `packaging/pg_sta.spec` | an RPM spec file |
 
@@ -1342,6 +1342,7 @@ LIMIT 20;
 | `ERROR: permission denied for table workload_sample` | The calling role is not the owner | Run as the extension owner, or `GRANT USAGE ON SCHEMA sta TO <role>` |
 | `workload_advice()` returns nothing | `pg_stat_statements` is not loaded | `SHOW shared_preload_libraries;` — it must contain `pg_stat_statements` |
 | `ERROR: relation "orders" does not exist` from `sta.plan_advice_string()` | The advice is read from a **live** plan, so the relations of the statement must exist in the database — as in PostgreSQL 19 | Create the tables, or load the demo fixture: `./scripts/load_sample_data.sh --database appdb` |
+| `ERROR: sta.explain: the statement refers to a relation or a column that does not exist here` | The statement belongs to another database — the advisor was run against a database that does not hold the relation | The hint names the database that is connected to; run the advisor against the database of the workload |
 | `plan_advice()` returns nothing for a slow query | `p_analyze` was false | pass `p_analyze => true` |
 | `validate()` returns `NOT_USED` | The planner ignored the index | The index does not match the predicate; check `EXPLAIN` |
 | `validate()` returns `NOT_COMPARABLE` | Different row counts between runs | The statement is not deterministic; wrap it or use a stable predicate |

@@ -50,6 +50,7 @@ cannot be validated is not a recommendation.
 | **Before / after report** | `sta.before_after_report()` measures **every** recommended change against the statement it belongs to and returns the plan before, the plan after and the gain — for the whole workload, with every change rolled back |
 | **Statement ids** | `sta.sql_id()` and `sta.sql_hash()` give the Oracle-style `SQL_ID` and `SQL_HASH`; `sta.queryid_info()` gives the `pg_stat_statements` query id, the normalised text and the workload of the statement |
 | **Explainability** | Every finding carries structured `evidence` (JSONB), not just prose |
+| **Clear errors** | A statement that names a relation of another database is reported as `sta.explain: the statement refers to a relation or a column that does not exist here`, with the message of the server as the detail and the connected database in the hint |
 | **Calibratable** | All 16 decision thresholds live in `sta.threshold` and can be tuned without recompiling |
 | **Catalogue** | `sta.advice_catalog()` is the self-describing catalogue of every finding the advisor can emit |
 | **PG19 plan advice** | `sta.plan_advice_string()` generates PostgreSQL 19 style advice from a plan; the advice round-trips — applying it reproduces the plan it was generated from |
@@ -541,7 +542,7 @@ pg_sta/
 │   └── installcheck.sh      run the regression suite
 ├── test/
 │   ├── qa_setup.sql         deliberate-defect fixture, split into phases
-│   ├── qa_assertions.sql    201 assertions
+│   ├── qa_assertions.sql    204 assertions
 │   └── run_qa.sh            the QA runner
 ├── packaging/pg_sta.spec    RPM package
 └── docs/                    the documentation set
@@ -553,7 +554,7 @@ pg_sta/
 
 ```bash
 make installcheck PG_CONFIG=/usr/pgsql-17/bin/pg_config   # regression suite
-make qa                                                     # QA suite (201 assertions)
+make qa                                                     # QA suite (204 assertions)
 ```
 
 The QA suite seeds a database with **deliberate defects** — an unanalysed
