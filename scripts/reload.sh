@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Recreate the pg_sta extension in the development database.
 #
-# The extension ships a single base script (sql/pg_sta--0.1.0.sql).  During
+# The extension ships a single base script (sql/pg_sta--0.1.1.sql).  During
 # development that script changes constantly, so the simplest and most
 # reliable way to pick up the new definition is to drop and recreate the
 # extension.  Only ever run this against a scratch database.

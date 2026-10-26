@@ -2,7 +2,7 @@
 %global pgversion 17
 
 Name:           pg_sta
-Version:        0.1.0
+Version:        0.1.2
 Release:        1%{?dist}
 Summary:        PostgreSQL SQL Tuning Advisor
 
@@ -48,7 +48,10 @@ make install DESTDIR=%{buildroot} PG_CONFIG=/usr/pgsql-%{pgversion}/bin/pg_confi
 %files
 %{_libdir}/pg_sta.so
 %{_datadir}/pgsql/extension/pg_sta.control
-%{_datadir}/pgsql/extension/pg_sta--0.1.0.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.2.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.0--0.1.2.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.1--0.1.2.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.0--0.1.1.sql
 %license LICENSE
 %doc README.md
 %doc docs/usage.md
@@ -56,5 +59,15 @@ make install DESTDIR=%{buildroot} PG_CONFIG=/usr/pgsql-%{pgversion}/bin/pg_confi
 %doc docs/pg19-compatibility.md
 
 %changelog
+* Sun Oct 25 2026 Jey <jey@example.com> - 0.1.2-1
+- Action plan and action script: runnable CREATE INDEX, ANALYZE, VACUUM
+  and rewritten statements, in the order in which they should be applied.
+- The advisor now sees the constants of a statement: the workload can
+  register the text of its statements with sta.record().
+- The rewritten statements are laid out one clause per line.
+
+* Sun Oct 25 2026 Jey <jey@example.com> - 0.1.1-1
+- Rewrite advice, index advice and workload-driven plan advice.
+
 * Mon Oct 25 2026 Jey <jey@example.com> - 0.1.0-1
 - Initial packaging of pg_sta 0.1.0 for PostgreSQL 17.

@@ -32,6 +32,9 @@
 #   plan SQL                 findings about the plan of one statement
 #   stats [SCHEMA]           findings about the statistics of the tables
 #   index SQL                index candidates for one statement
+#   rewrite SQL              SQL rewrite candidates for one statement
+#   actions [SQL]            the action plan: DDL, VACUUM/ANALYZE and rewrites
+#   script [SQL]             the action plan as a runnable SQL script
 #   validate DDL SQL         measure a proposed index against the current plan
 #   queryid SQL              the canonical query id of a statement
 #   explain SQL              the execution plan of a statement
@@ -50,6 +53,9 @@
 #   diff [SCHEMA]            compare the two most recent snapshots of a schema
 #   load-sample-data         create the sample tables and generate a workload
 #   install                  build and install the extension on the VM
+#   upgrade                  apply the newest extension version in place
+#                            (ALTER EXTENSION pg_sta UPDATE, keeps the
+#                             collected workload and the audit trail)
 #   regress                  run the regression suite
 #   qa                       run the QA suite
 #
@@ -60,6 +66,8 @@
 #   pg_sta_ctl --database appdb --output json report > findings.json
 #   pg_sta_ctl --database appdb plan "SELECT * FROM orders WHERE customer_id = 42"
 #   pg_sta_ctl --database appdb index "SELECT * FROM orders WHERE customer_id = 42"
+#   pg_sta_ctl --database appdb actions "SELECT * FROM orders WHERE customer_id = 42"
+#   pg_sta_ctl --database appdb script "SELECT * FROM orders WHERE customer_id = 42" > fix.sql
 #   pg_sta_ctl --database appdb validate \
 #       "CREATE INDEX idx_orders_customer ON orders (customer_id)" \
 #       "SELECT * FROM orders WHERE customer_id = 42"
@@ -126,7 +134,7 @@ done
 COMMAND="$1"; shift
 
 case "$COMMAND" in
-    plan|index|queryid|explain|plan-advice)
+    plan|index|rewrite|queryid|explain|plan-advice)
         [ $# -ge 1 ] || die "$COMMAND needs a SQL statement"
         SQL_ARG="$1"; shift ;;
     advice)
@@ -163,7 +171,11 @@ case "$COMMAND" in
     record)
         if [ $# -ge 1 ]; then SCOPE_ARG="$1"; shift; fi
         if [ $# -ge 1 ]; then TARGET_ARG="$1"; shift; fi ;;
-    collect|reset|workload|catalog|server-info|install|regress|qa) ;;
+    actions|script)
+        # The statement is optional: without it the action plan is built
+        # from the statements of the workload.
+        if [ $# -ge 1 ]; then SQL_ARG="$1"; shift; fi ;;
+    collect|reset|workload|catalog|server-info|install|regress|qa|upgrade) ;;
     load-sample-data)
         # The remaining arguments belong to the loader.
         EXTRA_ARGS=("$@")
@@ -442,6 +454,72 @@ FROM a;
 SQL
     ;;
 
+rewrite)
+    cat <<SQL | run_sql "-q -A -t"
+WITH a AS (
+    SELECT pattern, object_name, severity, confidence,
+           original_sql, rewritten_sql, finding_text,
+           recommendation, expected_benefit, estimated_cost, validation_steps
+    FROM sta.rewrite_advice($(sql_literal "$SQL_ARG"))
+)
+SELECT 'pg_sta: ' || count(*) || ' rewrite candidate(s)' || E'\n\n' ||
+       coalesce(string_agg(
+           '[REWRITE] ' || coalesce(pattern, '-') || ' (' || coalesce(object_name, '-') || ')' || E'\n' ||
+           '  original:    ' || coalesce(original_sql, '-') || E'\n' ||
+           '  rewritten:   ' || coalesce(rewritten_sql, '-') || E'\n' ||
+           '  observed:    ' || coalesce(finding_text, '-') || E'\n' ||
+           '  benefit:     ' || coalesce(expected_benefit, '-') || E'\n' ||
+           '  cost:        ' || coalesce(estimated_cost, '-') || E'\n' ||
+           '  confidence:  ' || coalesce(confidence, '-') || E'\n' ||
+           '  validate:    ' || coalesce(array_to_string(validation_steps, E'\n               '), '-'),
+           E'\n\n'), '')
+FROM a;
+SQL
+    ;;
+
+actions)
+    if [ -n "$SQL_ARG" ]; then
+        lit=$(sql_literal "$SQL_ARG")
+    else
+        lit="NULL"
+    fi
+    cat <<SQL | run_sql "-q -A -t"
+WITH a AS (
+    SELECT action_id, action_type, priority, object_name, query,
+           action_sql, finding, finding_text, severity, confidence,
+           rationale, expected_benefit, estimated_cost, risk, validation_steps
+    FROM sta.action_plan($lit, '$WINDOW', $ANALYZE, $LIMIT)
+)
+SELECT 'pg_sta: ' || count(*) || ' action(s)' || E'\n\n' ||
+       coalesce(string_agg(
+           '[' || action_type || '] ' || coalesce(object_name, '-') ||
+           ' (priority ' || priority || ', ' || coalesce(severity, '-') || ')' || E'\n' ||
+           '  sql:         ' || coalesce(action_sql, '-') || E'\n' ||
+           '  finding:     ' || coalesce(finding, '-') || E'\n' ||
+           '  observed:    ' || coalesce(finding_text, '-') || E'\n' ||
+           '  benefit:     ' || coalesce(expected_benefit, '-') || E'\n' ||
+           '  cost:        ' || coalesce(estimated_cost, '-') || E'\n' ||
+           '  risk:        ' || coalesce(risk, '-') || E'\n' ||
+           '  confidence:  ' || coalesce(confidence, '-') || E'\n' ||
+           '  validate:    ' || coalesce(array_to_string(validation_steps, E'\n               '), '-'),
+           E'\n\n'), '')
+FROM a;
+SQL
+    ;;
+
+script)
+    # The runnable script is printed exactly as it is: it is meant to be
+    # redirected to a file and executed with psql.
+    if [ -n "$SQL_ARG" ]; then
+        lit=$(sql_literal "$SQL_ARG")
+    else
+        lit="NULL"
+    fi
+    cat <<SQL | run_sql "-q -A -t"
+SELECT sta.action_script($lit, '$WINDOW', $ANALYZE, $LIMIT);
+SQL
+    ;;
+
 validate)
     cat <<SQL | run_sql "-q -A -t"
 SELECT 'verdict:        ' || verdict || E'\n' ||
@@ -556,6 +634,18 @@ SQL
 
 install)
     "$HERE/install.sh"
+    ;;
+upgrade)
+    # Apply the newest extension version to the target database without
+    # dropping the collected workload: ALTER EXTENSION ... UPDATE keeps
+    # every object, so the history in sta.* survives the upgrade.
+    require_extension
+    echo "pg_sta_ctl: upgrading the pg_sta extension in database '$DB'..."
+    printf '%s\n' \
+        "ALTER EXTENSION pg_sta UPDATE;" \
+        "SELECT extversion FROM pg_extension WHERE extname = 'pg_sta';" \
+        | pg_sta_psql "$DB" "-q -A -t" || die "ALTER EXTENSION pg_sta UPDATE failed"
+    echo "pg_sta_ctl: done."
     ;;
 
 load-sample-data)

@@ -26,6 +26,9 @@ only the extension interfaces PostgreSQL provides:
 | Are joins, filters, sorts or aggregations expensive? | `sta.plan_advice()` |
 | Are estimates far from reality? | `sta.plan_advice()` |
 | Which recommendations are worth testing? | `sta.recommendations()` |
+| What change do I make, exactly? | `sta.action_plan()` |
+| How do I run the changes? | `sta.action_script()` |
+| How do I rewrite this statement? | `sta.rewrite_statement()` |
 | How do I validate a proposed change? | `sta.validate()` |
 | Did the change help, without regressions? | `sta.validate()` |
 
@@ -135,12 +138,12 @@ The developer scripts in `scripts/` do this automatically:
 | Path | Purpose |
 |---|---|
 | `src/pg_sta.c` | the C core: plan capture, query ids, server introspection |
-| `sql/pg_sta--0.1.0.sql` | the advisory engine, the catalogue and the sample tables |
+| `sql/pg_sta--0.1.2.sql` | the advisory engine, the catalogue and the sample tables |
 | `sql/pg_sta.sql` | the regression suite (pg_regress) |
 | `sql/sample_data.sql`, `sql/sample_workload.sql` | the demo schema and the demo workload |
 | `scripts/pg_sta_ctl` | the command line client |
 | `scripts/*.sh` | build, install, reload, sample-data and test helpers for the dev VM |
-| `test/qa_setup.sql`, `test/qa_assertions.sql` | the QA suite (89 assertions) |
+| `test/qa_setup.sql`, `test/qa_assertions.sql` | the QA suite (133 assertions) |
 | `docs/` | the operational and design documentation |
 | `packaging/pg_sta.spec` | an RPM spec file |
 
@@ -181,7 +184,7 @@ sudo make PG_CONFIG=/usr/pgsql-17/bin/pg_config install
 
 - `pg_sta.so` → `$(pg_config --pkglibdir)`
 - `pg_sta.control` → `$(pg_config --sharedir)/extension`
-- `pg_sta--0.1.0.sql` → `$(pg_config --sharedir)/extension`
+- `pg_sta--0.1.2.sql` → `$(pg_config --sharedir)/extension`
 
 ---
 
@@ -429,6 +432,130 @@ ORDER BY run_id DESC;
 Use it to keep a record of what the advisor said, and whether the
 recommended change helped, across maintenance windows.
 
+### 6.9 The action plan — the change, as a runnable statement
+
+`sta.recommendations()` explains the findings. `sta.action_plan()` turns
+them into the **commands that implement them**, ordered by priority:
+
+```sql
+SELECT action_type, priority, object_name, action_sql, finding,
+       expected_benefit, estimated_cost, risk
+FROM sta.action_plan()
+ORDER BY priority, action_id;
+```
+
+Arguments: `(p_sql, p_window, p_analyze, p_limit)`.
+
+* `p_sql` — analyse one statement instead of the whole workload. When it
+  is given, the actions that belong to that statement are always returned,
+  even when the limit is reached.
+* `p_window` — `'cumulative'` (everything collected so far) or a window
+  name registered with `sta.snapshot_diff()`.
+* `p_analyze` — measure the statements, which produces estimate/mismatch
+  findings. Measuring runs the statement, so it is off by default.
+* `p_limit` — the maximum number of actions (1 … 200, default 50).
+
+There are four action types:
+
+| Action type | What it does | Example |
+|---|---|---|
+| `VACUUM_ANALYZE` | dead tuples / never vacuumed | `VACUUM (ANALYZE) public.orders;` |
+| `ANALYZE` | never analyzed / stale statistics | `ANALYZE public.orders;` |
+| `CREATE_INDEX` | missing index, with the full DDL | `CREATE INDEX CONCURRENTLY idx_orders_customer_id ON public.orders (customer_id);` |
+| `REWRITE` | the rewritten statement itself | `SELECT order_id, customer_id … WHERE NOT EXISTS (…)` |
+
+A trigram index needs the `pg_trgm` extension. When the extension is
+missing, the action carries the `CREATE EXTENSION IF NOT EXISTS pg_trgm;`
+statement with it, so the script stays runnable:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX CONCURRENTLY idx_customers_email_trgm
+    ON public.customers USING gin (email gin_trgm_ops);
+```
+
+### 6.10 The action script — everything as one runnable file
+
+`sta.action_script()` returns the whole plan as one commented script. Every
+step states why it is there, what it is expected to gain, what it costs
+and how to check that it worked:
+
+```bash
+sudo -u postgres psql -X -tA -d appdb \
+  -c "SELECT sta.action_script(NULL, 'cumulative', false, 100);" > /tmp/pg_sta_actions.sql
+
+less /tmp/pg_sta_actions.sql          # read it first
+sudo -u postgres psql -X -v ON_ERROR_STOP=1 -d appdb -f /tmp/pg_sta_actions.sql
+```
+
+The script is **runnable as it is**:
+
+* every statement is terminated with `;`,
+* a rewritten statement that uses a parameter placeholder (`$1`) is
+  emitted as a comment, with the instruction that says what the parameter
+  means — a placeholder cannot be run by `psql`,
+* `CREATE INDEX CONCURRENTLY` carries the note that it cannot run inside a
+  transaction block.
+
+The statistics come first (a correct estimate can remove the need for an
+index) and the rewritten statements come last.
+
+For one statement:
+
+```sql
+SELECT sta.action_script(
+    'SELECT * FROM orders WHERE customer_id NOT IN (SELECT customer_id FROM customers)');
+```
+
+### 6.11 Rewritten statements
+
+`sta.rewrite_advice()` lists the rules that apply to a statement, and
+`sta.rewrite_statement()` applies all of them and returns the result:
+
+```sql
+SELECT original_sql, rewritten_sql, applied, changed
+FROM sta.rewrite_statement(
+    'SELECT * FROM orders WHERE customer_id NOT IN (SELECT customer_id FROM customers)');
+```
+
+```
+           original_sql            |                    rewritten_sql                     |          applied
+----------------------------------+---------------------------------------------------------+------------------------
+ SELECT *                          | SELECT order_id,                                        | {NOT_IN_TO_NOT_EXISTS,
+ FROM orders                       |        customer_id,                                     |  SELECT_STAR}
+ WHERE customer_id NOT IN         |        order_date                                       |
+ (SELECT customer_id FROM ...)    | FROM orders                                             |
+                                  | WHERE NOT EXISTS (SELECT 1 FROM customers …)          |
+```
+
+`applied` lists the rules that fired. The rules are:
+
+| Rule | What it changes | Why |
+|---|---|---|
+| `IMPLICIT_CAST` | `col::text = '1'` → `col = 1` | a cast on the column side makes the predicate non-sargable |
+| `NON_SARGABLE_PREDICATE` | `col + 1 = 5` → `col = 4`, `date_col = date '…'` → `date_col BETWEEN …` | an expression on the column side cannot use an index |
+| `OR_TO_IN` | `a = 1 OR a = 2` → `a IN (1, 2)` | an `OR` of the same column is one lookup |
+| `NOT_IN_TO_NOT_EXISTS` | `NOT IN (subquery)` → `NOT EXISTS (…)` | `NOT IN` hashes the whole subquery and changes the NULL semantics |
+| `UNION_TO_UNION_ALL` | `UNION` → `UNION ALL` | `UNION` de-duplicates the result |
+| `LEADING_WILDCARD_LIKE` | `LIKE '%x'` → trigram index | a leading wildcard cannot use a B-tree index |
+| `SELECT_STAR` | `SELECT *` → the columns that exist | every column of the relation is read and widened on the way out |
+| `OFFSET_PAGINATION` | `OFFSET n` → `WHERE id > $n` | a deep offset reads and throws away the skipped rows |
+
+The rewrites are **suggestions, not equivalences**. Each finding lists
+the assumption it depends on (for example: `NOT IN` returns no rows at
+all when the subquery produces a single `NULL`, `NOT EXISTS` does not).
+Check the assumption before the rewritten statement is used.
+
+To keep the original text of a statement — `pg_stat_statements` normalises
+constants away — record it yourself:
+
+```sql
+SELECT sta.record('SELECT * FROM orders WHERE customer_id = 42');
+```
+
+`sta.record()` stores the text under its query id, and the advice is then
+produced for the statement as the application really writes it.
+
 ---
 
 ## 7. Validate a proposed change
@@ -495,6 +622,10 @@ The verdict is one of:
 # machine readable output
 ./scripts/pg_sta_ctl -d appdb -o json report > findings.json
 ./scripts/pg_sta_ctl -d appdb -o markdown report > findings.md
+
+# the change itself: the action plan and the runnable script
+./scripts/pg_sta_ctl -d appdb actions "SELECT * FROM orders WHERE customer_id = 42"
+./scripts/pg_sta_ctl -d appdb script  "SELECT * FROM orders WHERE customer_id = 42" > fix.sql
 ```
 
 The scripts work unchanged on the workstation and on the database host
@@ -634,7 +765,7 @@ UPDATE sta.threshold SET value = 0.05 WHERE name = 'dead_tuple_ratio';
 To restore the defaults, re-run the extension script:
 
 ```sql
-\i /usr/pgsql-17/share/extension/pg_sta--0.1.0.sql
+\i /usr/pgsql-17/share/extension/pg_sta--0.1.2.sql
 ```
 
 ### 9.1 Server settings

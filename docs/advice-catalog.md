@@ -22,9 +22,10 @@ SELECT * FROM sta.advice_catalog() ORDER BY category, finding;
 |---|---|
 | **workload** | 5 |
 | **plan** | 11 |
-| **statistics** | 5 |
+| **statistics** | 6 |
 | **snapshot** | 4 |
-| **Total** | **25** |
+| **rewrite** | 8 |
+| **Total** | **34** |
 
 ---
 
@@ -359,6 +360,26 @@ but is **not** required here. `pg_sta` never recommends `VACUUM FULL`.
 
 ---
 
+### `NEVER_VACUUMED` — LOW
+
+**What it means.** The relation has never been vacuumed since it was
+created or last reset, so the visibility map and the free space map are
+stale.
+
+**Evidence.** `pg_stat_all_tables.last_vacuum` / `last_autovacuum` are
+both NULL while `n_live_tup > 0`.
+
+**Recommended action.** Run `VACUUM (ANALYZE)` once, then let autovacuum
+keep it up to date.
+
+**Validation kind.** `vacuum`.
+
+**Cost.** One `VACUUM` pass over the relation. `pg_sta` never recommends
+`VACUUM FULL`, because that rewrites the table and takes an exclusive
+lock.
+
+---
+
 ### `NO_PRIMARY_KEY` — LOW
 
 **What it means.** The relation has no primary key.
@@ -529,6 +550,76 @@ because they enforce constraints rather than serve the workload.
 
 Condition 3 is what keeps the tool from proposing an index that already
 exists under a different name.
+
+---
+
+## 4b. Rewrite rules
+
+`sta.rewrite_advice()` does not emit findings about the *system* — it
+emits findings about the *text* of a statement, and it emits the
+**rewritten statement** that fixes the problem.
+
+```sql
+SELECT pattern, evidence, recommendation, validation_steps
+FROM   sta.rewrite_advice('SELECT * FROM orders WHERE lower(customer_name) = ''x''');
+```
+
+```sql
+SELECT * FROM sta.rewrite_statement(
+    'SELECT * FROM orders WHERE lower(customer_name) = ''x''');
+-- original_sql | rewritten_sql | applied | changed
+```
+
+| Rule | Severity | What it means | The rewrite it produces |
+|---|---|---|---|
+| `IMPLICIT_CAST` | HIGH | The filtered column is cast to `text` (`col::text = 'x'`), so an index on the column cannot be used. | The cast is removed and the literal is cast to the column's own type. |
+| `NON_SARGABLE_PREDICATE` | HIGH | A function is applied to the filtered column (`lower(col) = 'x'`, `date(ts) = '…'`), so a B-tree index on the column cannot be used. | The function is removed from the column side, or the expression is moved to a sargable form. |
+| `LEADING_WILDCARD_LIKE` | HIGH | The pattern starts with `%` (`col LIKE '%x%'`), so a B-tree index cannot be used. | A trigram index on the column is proposed (`CREATE EXTENSION IF NOT EXISTS pg_trgm;` plus the `CREATE INDEX`). |
+| `OR_TO_IN` | MEDIUM | The same column is tested twice with `OR` (`col = a OR col = b`), which the planner cannot serve with one index lookup. | The `OR` becomes an `IN` list on the column. |
+| `NOT_IN_TO_NOT_EXISTS` | MEDIUM | `NOT IN (SELECT …)` is evaluated as a hashed anti-join over the whole subquery. | The predicate becomes `NOT EXISTS` with a correlated subquery (the NULL semantics are checked first). |
+| `SELECT_STAR` | MEDIUM | The statement reads every column, including the ones it does not use. | The column list is replaced by the columns the statement actually uses. |
+| `OFFSET_PAGINATION` | MEDIUM | The statement skips rows with `OFFSET`, so the cost of a page grows with its depth. | A keyset condition on the sort key is added (`WHERE key > last_key ORDER BY key LIMIT n`). |
+| `UNION_TO_UNION_ALL` | LOW | `UNION` without `ALL` forces a duplicate elimination. | `UNION ALL` — but only after the branches are known to be disjoint. |
+
+Every rule is applied by one function, in one pass, in the order above.
+`sta.rewrite_statement()` returns the original text, the rewritten text,
+the list of rules that fired (`applied`) and a `changed` flag, so the
+rewrite can be reviewed before it is used.
+
+---
+
+## 4c. Action types
+
+`sta.action_plan()` turns findings and candidates into **actions**: the
+smallest set of statements that make the next run of the workload better.
+`sta.action_script()` renders the same actions as a runnable SQL script.
+
+| Action | Priority | Produced from | What it is |
+|---|---|---|---|
+| `VACUUM_ANALYZE` | 5 | `NEVER_VACUUMED`, `HIGH_DEAD_TUPLES` | `VACUUM (ANALYZE) <relation>;` |
+| `ANALYZE` | 10 | `NEVER_ANALYZED`, `STALE_STATISTICS` | `ANALYZE <relation>;` |
+| `CREATE_INDEX` | 20 | `sta.index_advice()` | The ready-to-run `CREATE INDEX CONCURRENTLY …` statement, with the `CREATE EXTENSION IF NOT EXISTS pg_trgm;` prefix when the index needs `pg_trgm`. |
+| `REWRITE` | 30 | `sta.rewrite_advice()` | The complete rewritten statement, ready to replace the original. |
+
+```sql
+SELECT action_type, priority, object_name, action_sql
+FROM   sta.action_plan(p_sql => 'SELECT * FROM orders WHERE …', p_limit => 50);
+```
+
+When `p_sql` is supplied, the actions that belong to *that* statement
+(`CREATE_INDEX` and `REWRITE`) are always returned, even when the limit
+is reached — the workload-wide statistics actions are the ones the limit
+applies to.
+
+The script is written so that it can be run as-is:
+
+```bash
+./scripts/pg_sta_ctl script "SELECT * FROM orders WHERE …" > fix.sql
+```
+
+Every statement in it is terminated, and a statement whose text cannot be
+determined is emitted as a comment, so the script never fails halfway
+through.
 
 ---
 

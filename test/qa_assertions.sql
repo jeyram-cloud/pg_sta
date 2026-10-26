@@ -897,6 +897,509 @@ END
 $$;
 
 -- -------------------------------------------------------------------------
+-- SQL rewrite advisor
+--
+-- Every rule below was silent before the word-boundary fix: the rules used
+-- the PCRE escape "\b", which PostgreSQL's ARE engine interprets as a
+-- backspace character, so none of them ever matched.  These assertions
+-- pin the rules down so the defect cannot come back.
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_patterns  text[];
+    v_row       record;
+    v_sql       text;
+    v_expected  text[];
+    v_rule      text;
+    v_count     integer;
+BEGIN
+    -- The rule, the statement that must trigger it and the pattern that
+    -- must be reported.
+    v_expected := ARRAY[
+        'SELECT_STAR',
+        'OR_TO_IN',
+        'NOT_IN_TO_NOT_EXISTS',
+        'NON_SARGABLE_PREDICATE',
+        'IMPLICIT_CAST',
+        'LEADING_WILDCARD_LIKE',
+        'UNION_TO_UNION_ALL',
+        'OFFSET_PAGINATION'
+    ];
+
+    FOR v_rule IN SELECT unnest(v_expected) LOOP
+        -- The statement that triggers the rule.  Every one of them uses a
+        -- table of the QA schema.  A CASE expression must not carry a
+        -- semicolon inside: in PL/pgSQL the semicolon ends the statement.
+        v_sql := CASE v_rule
+            WHEN 'SELECT_STAR' THEN
+                'SELECT * FROM pa_fact'
+            WHEN 'OR_TO_IN' THEN
+                'SELECT id FROM pa_fact WHERE dim1_id = 1 OR dim1_id = 2'
+            WHEN 'NOT_IN_TO_NOT_EXISTS' THEN
+                'SELECT id FROM pa_fact WHERE dim1_id NOT IN (SELECT id FROM pa_dim1)'
+            WHEN 'NON_SARGABLE_PREDICATE' THEN
+                'SELECT id FROM pa_dim1 WHERE lower(dim1) = ''filler 1'''
+            WHEN 'IMPLICIT_CAST' THEN
+                'SELECT id FROM pa_fact WHERE dim1_id::text = ''1'''
+            WHEN 'LEADING_WILDCARD_LIKE' THEN
+                'SELECT id FROM pa_fact WHERE dim1_id LIKE ''%1%'''
+            WHEN 'UNION_TO_UNION_ALL' THEN
+                'SELECT id FROM pa_fact UNION SELECT id FROM pa_fact'
+            WHEN 'OFFSET_PAGINATION' THEN
+                'SELECT id FROM pa_fact ORDER BY id LIMIT 10 OFFSET 100'
+        END CASE;
+
+        SELECT coalesce(array_agg(r.pattern), '{}') INTO v_patterns
+          FROM sta.rewrite_advice(v_sql) r
+         WHERE r.finding = v_rule;
+
+        INSERT INTO qa_result VALUES (default,
+            'rewrite: the rule ' || v_rule || ' fires',
+            '1', coalesce(array_length(v_patterns, 1), 0)::text,
+            coalesce(array_length(v_patterns, 1), 0) = 1);
+    END LOOP;
+
+    -- A rewritten statement must really be different from the original.
+    SELECT r.original_sql, r.rewritten_sql INTO v_row
+      FROM sta.rewrite_advice('SELECT * FROM pa_fact') r
+     WHERE r.finding = 'SELECT_STAR';
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite: the rewritten statement differs from the original',
+        'different', CASE WHEN v_row.original_sql = v_row.rewritten_sql
+                          THEN 'identical' ELSE 'different' END,
+        v_row.original_sql IS DISTINCT FROM v_row.rewritten_sql);
+
+    -- The rewrite advisor must report its evidence and its validation
+    -- procedure, not just a pattern.
+    SELECT count(*) INTO v_count FROM sta.rewrite_advice('SELECT * FROM pa_fact') r
+     WHERE r.finding = 'SELECT_STAR'
+       AND r.evidence IS NOT NULL
+       AND r.validation_steps IS NOT NULL
+       AND array_length(r.validation_steps, 1) > 0
+       AND r.expected_benefit IS NOT NULL
+       AND r.estimated_cost IS NOT NULL;
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite: every finding carries evidence, benefit, cost and validation steps',
+        '1', v_count::text, v_count = 1);
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- Index advisor
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_count integer;
+    v_ddl   text;
+BEGIN
+    -- pa_fact has no index on dim1_id, so the advisor must propose one.
+    SELECT count(*), min(suggested_ddl) INTO v_count, v_ddl
+      FROM sta.index_advice(
+        'SELECT id FROM pa_fact WHERE dim1_id = 1');
+
+    INSERT INTO qa_result VALUES (default,
+        'index: an index candidate is proposed for an unindexed filter column',
+        '>=1', v_count::text, v_count >= 1);
+
+    INSERT INTO qa_result VALUES (default,
+        'index: the candidate is a CREATE INDEX statement',
+        'create index', lower(coalesce(v_ddl, '')),
+        lower(coalesce(v_ddl, '')) LIKE 'create index%');
+
+    -- A statement that filters on the primary key needs no new index.
+    SELECT count(*) INTO v_count
+      FROM sta.index_advice('SELECT id FROM sta_qa.pa_fact WHERE id = 1');
+
+    INSERT INTO qa_result VALUES (default,
+        'index: no candidate is proposed for a primary key filter',
+        '0', v_count::text, v_count = 0);
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- Workload driven plan advice
+--
+-- sta.recommendations() must analyse the hot statements of the captured
+-- workload even when it is called without an explicit statement.  Before
+-- the fix the plan, index and rewrite branches were only populated when
+-- p_sql was given, so a plain report never mentioned them.
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_count  integer;
+    v_queryid bigint;
+BEGIN
+    SELECT count(*) INTO v_count
+      FROM sta.recommendations(NULL, 'cumulative') r
+     WHERE r.category = 'plan';
+
+    INSERT INTO qa_result VALUES (default,
+        'recommendations: plan findings are produced without an explicit statement',
+        '>=1', v_count::text, v_count >= 1);
+
+    SELECT count(*) INTO v_count
+      FROM sta.recommendations(NULL, 'cumulative') r
+     WHERE r.category = 'index';
+
+    INSERT INTO qa_result VALUES (default,
+        'recommendations: index findings are produced without an explicit statement',
+        '>=1', v_count::text, v_count >= 1);
+
+    -- The statement advisor must report the missing index as well.
+    SELECT d.queryid INTO v_queryid
+      FROM sta._workload_delta('cumulative') d
+     WHERE d.query ILIKE '%big_events%'
+     ORDER BY d.total_exec_time DESC
+     LIMIT 1;
+
+    INSERT INTO qa_result VALUES (default,
+        'statement_advice: the hot statement of the workload is found',
+        'not null', coalesce(v_queryid::text, 'null'), v_queryid IS NOT NULL);
+
+    SELECT count(*) INTO v_count
+      FROM sta.statement_advice(v_queryid) s
+     WHERE s.category = 'index';
+
+    INSERT INTO qa_result VALUES (default,
+        'statement_advice: the index findings are reported',
+        '>=1', v_count::text, v_count >= 1);
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- Action plan
+--
+-- The action plan is the "advanced" part of the advisor: it turns the
+-- findings into the statements that have to be run, and it has to give
+-- the complete DDL for an index, the complete command for the statistics
+-- and the complete rewritten SQL.  These assertions pin all three down.
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_count   integer;
+    v_ddl     text;
+    v_sql     text;
+    v_dupes   integer;
+    v_types   text[];
+BEGIN
+    -- The plan must contain a CREATE INDEX action, and the action has to be
+    -- a runnable CREATE INDEX statement with the relation and the columns.
+    SELECT count(*), min(a.action_sql) INTO v_count, v_ddl
+      FROM sta.action_plan(NULL, 'cumulative', false, 100) a
+     WHERE a.action_type = 'CREATE_INDEX';
+
+    INSERT INTO qa_result VALUES (default,
+        'action_plan: a CREATE INDEX action is produced',
+        '>=1', v_count::text, v_count >= 1);
+
+    INSERT INTO qa_result VALUES (default,
+        'action_plan: the index action is a complete CREATE INDEX statement',
+        'create index concurrently', lower(coalesce(v_ddl, '')),
+        lower(coalesce(v_ddl, '')) LIKE 'create index concurrently%'
+        AND lower(coalesce(v_ddl, '')) LIKE '% on % (%');
+
+    -- The same index must not be proposed twice.
+    SELECT count(*) INTO v_dupes
+      FROM (SELECT a.action_sql FROM sta.action_plan(NULL, 'cumulative', false, 100) a
+             WHERE a.action_type = 'CREATE_INDEX'
+             GROUP BY a.action_sql HAVING count(*) > 1) d;
+
+    INSERT INTO qa_result VALUES (default,
+        'action_plan: the same index is not proposed twice',
+        '0', v_dupes::text, v_dupes = 0);
+
+    -- The plan must contain an ANALYZE action for a relation that was
+    -- never analyzed, and a VACUUM (ANALYZE) action for a relation with
+    -- dead tuples.
+    SELECT count(*) INTO v_count
+      FROM sta.action_plan(NULL, 'cumulative', false, 100) a
+     WHERE a.action_type = 'ANALYZE'
+       AND a.action_sql LIKE 'ANALYZE %;';
+
+    INSERT INTO qa_result VALUES (default,
+        'action_plan: an ANALYZE action is produced for a relation that was never analyzed',
+        '>=1', v_count::text, v_count >= 1);
+
+    SELECT count(*) INTO v_count
+      FROM sta.action_plan(NULL, 'cumulative', false, 100) a
+     WHERE a.action_type = 'VACUUM_ANALYZE'
+       AND a.action_sql LIKE 'VACUUM (ANALYZE) %;';
+
+    INSERT INTO qa_result VALUES (default,
+        'action_plan: a VACUUM (ANALYZE) action is produced for a bloated relation',
+        '>=1', v_count::text, v_count >= 1);
+
+    -- One relation must not receive the same command twice.
+    SELECT count(*) INTO v_dupes
+      FROM (SELECT a.action_type, a.object_name FROM sta.action_plan(NULL, 'cumulative', false, 100) a
+             WHERE a.action_type IN ('ANALYZE', 'VACUUM_ANALYZE')
+             GROUP BY 1, 2 HAVING count(*) > 1) d;
+
+    INSERT INTO qa_result VALUES (default,
+        'action_plan: a relation does not receive the same statistics command twice',
+        '0', v_dupes::text, v_dupes = 0);
+
+    -- The action types the advisor knows, and nothing else.
+    SELECT array_agg(DISTINCT a.action_type ORDER BY a.action_type) INTO v_types
+      FROM sta.action_plan(NULL, 'cumulative', false, 100) a;
+
+    INSERT INTO qa_result VALUES (default,
+        'action_plan: only known action types are produced',
+        'ANALYZE,CREATE_INDEX,REWRITE,VACUUM_ANALYZE',
+        coalesce(array_to_string(v_types, ','), ''),
+        coalesce(array_to_string(v_types, ','), '') ~ '^ANALYZE(,CREATE_INDEX)?(,REWRITE)?(,VACUUM_ANALYZE)?$');
+
+    -- The rewritten statements must be complete SQL, not a sketch.
+    SELECT a.action_sql INTO v_sql
+      FROM sta.action_plan(NULL, 'cumulative', false, 100) a
+     WHERE a.action_type = 'REWRITE'
+     ORDER BY a.action_id
+     LIMIT 1;
+
+    INSERT INTO qa_result VALUES (default,
+        'action_plan: a rewritten statement is a complete statement',
+        'select', lower(left(coalesce(v_sql, ''), 6)),
+        lower(left(coalesce(v_sql, ''), 6)) = 'select');
+
+    -- The script is the plan in one runnable text.
+    SELECT count(*) INTO v_count
+      FROM sta.action_script(NULL, 'cumulative', false, 100) s
+     WHERE s LIKE '%-- Command:%'
+       AND s LIKE '%-- Why:%';
+
+    INSERT INTO qa_result VALUES (default,
+        'action_plan: the action script explains every step',
+        '1', v_count::text, v_count = 1);
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- Advanced advice: expression indexes, statistics commands, formatted SQL
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_count integer;
+    v_ddl   text;
+    v_sql   text;
+BEGIN
+    -- A function on the filtered column needs an expression index, not a
+    -- plain index on the column.
+    SELECT count(*), min(suggested_ddl) INTO v_count, v_ddl
+      FROM sta.index_advice('SELECT id FROM big_events WHERE lower(status) = ''paid''');
+
+    INSERT INTO qa_result VALUES (default,
+        'index: a function on the filtered column produces an expression index',
+        '>=1', v_count::text, v_count >= 1);
+
+    INSERT INTO qa_result VALUES (default,
+        'index: the expression index keeps the expression in its definition',
+        '(lower(status))', coalesce(v_ddl, ''),
+        coalesce(v_ddl, '') LIKE '%(lower(status))%');
+
+    -- The rewritten statement must be formatted, not a run of tokens.
+    SELECT sta._format_sql('SELECT count(*) FROM pa_fact WHERE dim1_id IN (1,2) AND dim2_id BETWEEN (1 AND 2)') INTO v_sql;
+
+    INSERT INTO qa_result VALUES (default,
+        'formatter: the output keeps the spaces of the SQL keywords',
+        'IN (1, 2) AND dim2_id BETWEEN (1 AND 2)',
+        coalesce(v_sql, ''),
+        coalesce(v_sql, '') LIKE '%IN (1, 2) AND dim2_id BETWEEN (1 AND 2)%');
+
+    -- The keyset pagination rewrite replaces the OFFSET with a parameter.
+    SELECT r.rewritten_sql INTO v_sql
+      FROM sta.rewrite_advice('SELECT id FROM pa_fact ORDER BY id LIMIT 10 OFFSET 100') r
+     WHERE r.finding = 'OFFSET_PAGINATION';
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite: the keyset pagination replaces the OFFSET with a seek condition',
+        '> $1 and no OFFSET',
+        coalesce(v_sql, ''),
+        coalesce(v_sql, '') LIKE '%> $1%'
+        AND coalesce(v_sql, '') NOT ILIKE '%OFFSET%');
+
+    -- The implicit cast rewrite removes the cast.
+    SELECT r.rewritten_sql INTO v_sql
+      FROM sta.rewrite_advice('SELECT id FROM pa_fact WHERE dim1_id::text = ''1''') r
+     WHERE r.finding = 'IMPLICIT_CAST';
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite: the implicit cast is removed from the comparison',
+        'dim1_id = 1', coalesce(v_sql, ''),
+        coalesce(v_sql, '') LIKE '%dim1_id = 1%'
+        AND coalesce(v_sql, '') NOT LIKE '%::text%');
+
+    -- The NOT IN rewrite must produce a NOT EXISTS with a correct qualifier.
+    SELECT r.rewritten_sql INTO v_sql
+      FROM sta.rewrite_advice('SELECT id FROM pa_fact WHERE dim1_id NOT IN (SELECT id FROM pa_dim1)') r
+     WHERE r.finding = 'NOT_IN_TO_NOT_EXISTS';
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite: the NOT IN becomes a NOT EXISTS with a correlated condition',
+        'NOT EXISTS (SELECT 1 FROM pa_dim1 ...)',
+        coalesce(v_sql, ''),
+        coalesce(v_sql, '') LIKE '%NOT EXISTS (SELECT 1 FROM pa_dim1%'
+        AND coalesce(v_sql, '') LIKE '%pa_fact.dim1_id%');
+
+    -- Every rewritten statement must still be valid SQL.
+    -- sta._explain_safe() returns NULL instead of raising, so a rewritten
+    -- statement that the server cannot plan is simply not counted.
+    SELECT count(*) INTO v_count
+      FROM sta.rewrite_advice('SELECT id FROM pa_fact WHERE dim1_id NOT IN (SELECT id FROM pa_dim1)') r
+     WHERE r.rewritten_sql IS NOT NULL
+       AND sta._explain_safe(r.rewritten_sql) IS NOT NULL;
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite: a rewritten statement can still be planned by the server',
+        '>=1', v_count::text, v_count >= 1);
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- Combined rewrite (sta.rewrite_statement)
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_count   integer;
+    v_sql     text;
+    v_script  text;
+    v_applied text[];
+    v_changed boolean;
+BEGIN
+    -- One statement, several rules: the implicit cast is removed, the OR
+    -- of equalities becomes an IN list and the SELECT * is expanded.
+    SELECT r.rewritten_sql, r.applied, r.changed
+      INTO v_sql, v_applied, v_changed
+      FROM sta.rewrite_statement(
+               'SELECT * FROM pa_fact WHERE dim1_id::text = ''1'' OR dim1_id::text = ''2''') r;
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite_statement: several rules are applied to one statement',
+        '>=3', coalesce(array_length(v_applied, 1), 0)::text,
+        coalesce(array_length(v_applied, 1), 0) >= 3);
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite_statement: the combined rewrite contains every fix',
+        'dim1_id IN (1, 2)',
+        coalesce(v_sql, ''),
+        coalesce(v_sql, '') LIKE '%dim1_id IN (1, 2)%'
+        AND coalesce(v_sql, '') NOT LIKE '%::text%'
+        AND coalesce(v_sql, '') NOT LIKE '%SELECT *%');
+
+    -- The combined rewrite must still be valid SQL.
+    INSERT INTO qa_result VALUES (default,
+        'rewrite_statement: the combined rewrite can still be planned',
+        '>=1',
+        CASE WHEN sta._explain_safe(v_sql) IS NOT NULL THEN '1' ELSE '0' END,
+        sta._explain_safe(v_sql) IS NOT NULL);
+
+    -- A statement without a problem is left alone.
+    SELECT r.applied, r.changed INTO v_applied, v_changed
+      FROM sta.rewrite_statement('SELECT id FROM pa_fact WHERE id = 1') r;
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite_statement: a clean statement is not changed',
+        '0,false',
+        coalesce(array_length(v_applied, 1), 0)::text || ',' || coalesce(v_changed, false)::text,
+        coalesce(array_length(v_applied, 1), 0) = 0 AND coalesce(v_changed, false) = false);
+
+    -- The UNION rewrite must use the canonical upper-case spelling.
+    SELECT r.rewritten_sql INTO v_sql
+      FROM sta.rewrite_statement(
+               'SELECT id FROM pa_fact UNION SELECT id FROM pa_fact') r;
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite_statement: UNION ALL is written in upper case',
+        '>=1',
+        CASE WHEN coalesce(v_sql, '') LIKE '%UNION ALL%'
+              AND coalesce(v_sql, '') NOT LIKE '%union all%'
+             THEN '1' ELSE '0' END,
+        coalesce(v_sql, '') LIKE '%UNION ALL%'
+        AND coalesce(v_sql, '') NOT LIKE '%union all%');
+
+    -- A star in a statement whose outer query names one relation can be
+    -- expanded, also when the statement has a subquery.
+    SELECT r.rewritten_sql INTO v_sql
+      FROM sta.rewrite_statement(
+               'SELECT * FROM pa_fact WHERE dim1_id NOT IN (SELECT id FROM pa_dim1)') r;
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite_statement: a star is expanded when the outer query has one relation',
+        '>=1',
+        CASE WHEN coalesce(v_sql, '') NOT LIKE '%SELECT *%'
+              AND coalesce(v_sql, '') LIKE '%FROM pa_fact%'
+             THEN '1' ELSE '0' END,
+        coalesce(v_sql, '') NOT LIKE '%SELECT *%'
+        AND coalesce(v_sql, '') LIKE '%FROM pa_fact%');
+
+    -- A join names two relations, so the star is ambiguous and is left
+    -- alone.
+    SELECT r.rewritten_sql INTO v_sql
+      FROM sta.rewrite_statement(
+               'SELECT * FROM pa_fact p JOIN pa_dim1 d ON d.id = p.dim1_id') r;
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite_statement: a star is kept when the outer query has a join',
+        '>=1',
+        CASE WHEN coalesce(v_sql, '') LIKE '%SELECT *%' THEN '1' ELSE '0' END,
+        coalesce(v_sql, '') LIKE '%SELECT *%');
+
+    -- The action plan must emit one REWRITE action per statement, not one
+    -- action per rule.
+    SELECT count(*) INTO v_count
+      FROM (SELECT a.queryid
+              FROM sta.action_plan(NULL, 'cumulative', false, 100) a
+             WHERE a.action_type = 'REWRITE'
+             GROUP BY a.queryid HAVING count(*) > 1) d;
+
+    INSERT INTO qa_result VALUES (default,
+        'action_plan: a query receives at most one REWRITE action',
+        '0', v_count::text, v_count = 0);
+
+    -- Every statement of the action script has to be terminated, so that
+    -- the script can be run as it is.
+    SELECT sta.action_script(
+               'SELECT * FROM pa_fact WHERE dim1_id::text = ''1''',
+               'window', false, 100) INTO v_script;
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: a rewritten statement in the script is terminated',
+        '>=1',
+        CASE WHEN coalesce(v_script, '') LIKE '%WHERE dim1_id = 1;%'
+             THEN '1' ELSE '0' END,
+        coalesce(v_script, '') LIKE '%WHERE dim1_id = 1;%');
+
+    -- A rewrite with a parameter placeholder cannot be run as it is, so the
+    -- script shows it as a comment and keeps the script runnable.
+    SELECT sta.action_script(
+               'SELECT * FROM pa_fact ORDER BY id LIMIT 10 OFFSET 100',
+               'window', false, 100) INTO v_script;
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: a statement with a placeholder is shown as a comment',
+        '>=1',
+        CASE WHEN coalesce(v_script, '') LIKE '%-- WHERE pa_fact.id > $1%'
+             THEN '1' ELSE '0' END,
+        coalesce(v_script, '') LIKE '%-- WHERE pa_fact.id > $1%');
+
+    -- The advice about the statement that was asked for must not be cut off
+    -- by the limit, even when the limit is small and the workload carries a
+    -- lot of statistics advice.
+    SELECT sta.action_script(
+               'SELECT * FROM pa_fact WHERE dim1_id::text = ''1''',
+               'window', false, 1) INTO v_script;
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the rewrite of the requested statement is kept',
+        '>=1',
+        CASE WHEN coalesce(v_script, '') LIKE '%WHERE dim1_id = 1;%'
+             THEN '1' ELSE '0' END,
+        coalesce(v_script, '') LIKE '%WHERE dim1_id = 1;%');
+END
+$$;
+
+-- -------------------------------------------------------------------------
 -- Final report
 -- -------------------------------------------------------------------------
 -- Emitted unaligned with '|' as the separator so that test/run_qa.sh can

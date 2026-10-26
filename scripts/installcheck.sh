@@ -60,6 +60,7 @@ sudo chown -R postgres:postgres '$PG_STA_WORKDIR' 2>/dev/null || true
 $AS_PG psql -tAc \"SELECT 1 FROM pg_database WHERE datname='$PG_STA_TESTDB'\" | grep -q 1 \
     || $AS_PG createdb '$PG_STA_TESTDB'
 cd '$PG_STA_WORKDIR'
+$AS_PG psql -X -q -d '$PG_STA_TESTDB' -c 'DROP EXTENSION IF EXISTS pg_sta CASCADE'
 $AS_PG env PATH=/usr/pgsql-17/bin:\$PATH PGHOST=/var/run/postgresql \
     make installcheck PG_CONFIG='$PG_STA_PG_CONFIG' \
     REGRESS_OPTS='--dbname=$PG_STA_TESTDB' 2>&1 | tail -40

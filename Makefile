@@ -11,7 +11,11 @@
 EXTENSION   = pg_sta
 MODULE_big  = pg_sta
 OBJS        = src/pg_sta.o
-DATA        = sql/pg_sta--0.1.0.sql
+EXTVERSION  = 0.1.2
+DATA        = sql/pg_sta--$(EXTVERSION).sql \
+           sql/pg_sta--0.1.0--$(EXTVERSION).sql \
+           sql/pg_sta--0.1.1--$(EXTVERSION).sql \
+           sql/pg_sta--0.1.0--0.1.1.sql
 REGRESS     = pg_sta
 
 PG_CONFIG  ?= pg_config
@@ -27,6 +31,17 @@ PGSTA_PG_CONFIG ?= /usr/pgsql-17/bin/pg_config
 REGRESS_OPTS ?= --dbname=pg_sta_regress
 
 # Extra developer conveniences -------------------------------------------
+.PHONY: upgrade-script
+upgrade-script:
+	python3 scripts/gen_upgrade.py 0.1.0 $(EXTVERSION)
+	python3 scripts/gen_upgrade.py 0.1.1 $(EXTVERSION)
+
+.PHONY: lint
+lint:
+	python3 scripts/lint_sql.py sql/pg_sta--$(EXTVERSION).sql \
+	        sql/pg_sta--0.1.0--$(EXTVERSION).sql \
+	        sql/pg_sta--0.1.1--$(EXTVERSION).sql
+
 .PHONY: qa
 qa:
 	./test/run_qa.sh

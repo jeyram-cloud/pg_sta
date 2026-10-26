@@ -1,4 +1,4 @@
-/* pg_sta--0.1.0.sql -- PostgreSQL SQL Tuning Advisor */
+/* pg_sta--0.1.1.sql -- PostgreSQL SQL Tuning Advisor */
 
 \echo Use "CREATE EXTENSION pg_sta" to load this file. \quit
 
@@ -141,6 +141,28 @@ CREATE TABLE sta.index_sample (
 
 CREATE INDEX index_sample_captured_at_idx
     ON sta.index_sample (captured_at);
+
+-- The text that pg_stat_statements stores is normalised: every constant is
+-- replaced by a $n placeholder.  The advisor can still plan such a
+-- statement, but it cannot see the values, and a rule such as "the pattern
+-- starts with a wildcard" needs the value.  A workload therefore registers
+-- the text of its statements here, and the advisor uses that text whenever
+-- it can be matched to a captured statement by its canonical query id.
+CREATE TABLE sta.workload_statement (
+    id               bigserial PRIMARY KEY,
+    captured_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
+    queryid          bigint      NOT NULL,
+    query            text        NOT NULL,
+    normalized_query text        NOT NULL,
+    source           text        NOT NULL DEFAULT 'manual'
+);
+
+CREATE INDEX workload_statement_queryid_idx
+    ON sta.workload_statement (queryid);
+CREATE INDEX workload_statement_captured_at_idx
+    ON sta.workload_statement (captured_at);
+CREATE INDEX workload_statement_normalized_idx
+    ON sta.workload_statement (normalized_query);
 
 CREATE TABLE sta.advice_run (
     run_id        bigserial PRIMARY KEY,
@@ -438,6 +460,107 @@ COMMENT ON FUNCTION sta.reset() IS
   'Delete every snapshot and advice run recorded by sta.';
 
 ------------------------------------------------------------------------------
+-- Raw statement text
+--
+-- pg_stat_statements stores the normalised text of a statement: every
+-- constant is replaced by a $n placeholder.  The planner can work with
+-- that text, but a rewrite rule such as "the LIKE pattern starts with a
+-- wildcard" or "the OFFSET skips 10000 rows" needs the values.
+--
+-- sta.record() registers the text of a statement exactly as it was
+-- written.  The advisor looks the text up by its canonical query id, so
+-- the counters still come from pg_stat_statements while the rules see the
+-- real constants.  Registering a statement is optional: the advisor works
+-- without it, it just cannot see the values.
+------------------------------------------------------------------------------
+CREATE FUNCTION sta.record(
+    p_sql   text,
+    p_source text DEFAULT 'manual'
+)
+RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_qid  bigint;
+    v_norm text;
+BEGIN
+    IF p_sql IS NULL OR btrim(p_sql) = '' THEN
+        RAISE EXCEPTION 'sta.record: the statement text is empty';
+    END IF;
+
+    v_qid := sta.queryid(p_sql);
+    IF v_qid IS NULL THEN
+        RAISE EXCEPTION 'sta.record: the statement could not be parsed';
+    END IF;
+
+    v_norm := sta.queryid_normalized(p_sql);
+
+    INSERT INTO sta.workload_statement (queryid, query, normalized_query, source)
+    VALUES (v_qid, p_sql, v_norm, coalesce(p_source, 'manual'));
+
+    RETURN v_qid;
+END
+$$;
+
+COMMENT ON FUNCTION sta.record(text, text) IS
+  'Register the text of a statement so that the advisor can see its constants.';
+
+/*
+ * The text of a statement as it was written.
+ *
+ * The advisor works on the text that pg_stat_statements stores, and that
+ * text holds a $n placeholder for every constant.  When the workload
+ * registered the original text of the statement, the advisor uses that
+ * text instead: the rules can then see the values, and the rewritten
+ * statement can be executed as it is.
+ */
+CREATE FUNCTION sta._raw_statement(p_sql text)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_raw text;
+BEGIN
+    IF p_sql IS NULL OR btrim(p_sql) = '' THEN
+        RETURN p_sql;
+    END IF;
+
+    -- Text without a placeholder is the text as it was written.
+    IF p_sql !~ '\$[0-9]+' THEN
+        RETURN p_sql;
+    END IF;
+
+    -- The exact text of the statement as pg_stat_statements stores it.
+    SELECT w.query
+      INTO v_raw
+      FROM sta.workload_statement w
+     WHERE w.normalized_query = p_sql
+     ORDER BY w.id DESC
+     LIMIT 1;
+
+    IF v_raw IS NULL THEN
+        -- The same statement, found through its query id.
+        BEGIN
+            SELECT w.query
+              INTO v_raw
+              FROM sta.workload_statement w
+             WHERE w.queryid = sta.queryid(p_sql)
+             ORDER BY w.id DESC
+             LIMIT 1;
+        EXCEPTION WHEN others THEN
+            v_raw := NULL;
+        END;
+    END IF;
+
+    RETURN COALESCE(v_raw, p_sql);
+END
+$$;
+
+COMMENT ON FUNCTION sta._raw_statement(text) IS
+  'The text of a statement as it was written, when the workload registered it.';
+
+------------------------------------------------------------------------------
 -- Audit trail
 --
 -- The advisory functions themselves stay read-only: writing a row for every
@@ -543,6 +666,12 @@ AS $$
             'Apply the change.',
             'Let the workload run for a comparable period.',
             'Compare mean and total execution time and the buffer hit ratio.']
+        WHEN 'rewrite' THEN ARRAY[
+            'Save the original statement and run EXPLAIN (ANALYZE, BUFFERS) on it.',
+            'Run the rewritten statement with the same parameters and compare the result sets row by row.',
+            'Compare the plan shape and the buffer counts of both statements.',
+            'Check that the assumptions the finding lists hold (NULL values, case of the stored text, unique sort key).',
+            'Measure the statement again in the application before the rewrite is kept.']
         ELSE ARRAY['Measure before and after with the same workload.']
     END
 $$;
@@ -629,7 +758,18 @@ AS $$
     )
     SELECT
         m.queryid,
-        m.query,
+        COALESCE(
+            (SELECT w.query
+               FROM sta.workload_statement w
+              WHERE w.normalized_query = m.query
+              ORDER BY w.id DESC
+              LIMIT 1),
+            (SELECT w.query
+               FROM sta.workload_statement w
+              WHERE w.queryid = m.queryid
+              ORDER BY w.id DESC
+              LIMIT 1),
+            m.query),
         m.calls,
         m.total_exec_time,
         CASE WHEN m.calls > 0 THEN m.total_exec_time / m.calls ELSE m.total_exec_time END,
@@ -645,6 +785,42 @@ $$;
 
 COMMENT ON FUNCTION sta._workload_delta(text) IS
   'Workload counters for the most recent snapshot, or the delta between the two most recent snapshots.';
+
+/*
+ * The statements that the plan, rewrite and index advisors run against.
+ *
+ * Only the statements that read data are of interest here: a statement
+ * that loads rows cannot be improved with an index on the relation it
+ * writes to, and it has no rewritten form either.  A statement is also
+ * only worth analysing when it reads a relation that exists, because the
+ * advisors work from the plan of the statement.
+ */
+CREATE FUNCTION sta._workload_targets(p_window text DEFAULT 'window',
+                                      p_limit  integer DEFAULT 25)
+RETURNS TABLE (
+    sql             text,
+    queryid         bigint,
+    calls           bigint,
+    total_exec_time double precision
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT d.query::text, d.queryid, d.calls, d.total_exec_time
+    FROM sta._workload_delta(p_window) d
+    WHERE d.query IS NOT NULL
+      AND d.queryid IS NOT NULL
+      AND d.query ~* '^\s*(select|with|table|values)\s'
+      AND EXISTS (
+            SELECT 1
+              FROM unnest(sta._sql_relations(d.query)) r
+             WHERE to_regclass(r) IS NOT NULL)
+    ORDER BY d.total_exec_time DESC, d.calls DESC
+    LIMIT LEAST(GREATEST(p_limit, 1), 50)
+$$;
+
+COMMENT ON FUNCTION sta._workload_targets(text, integer) IS
+  'The read-only statements of the workload that the statement advisors analyse.';
 
 ------------------------------------------------------------------------------
 -- Workload advice
@@ -962,6 +1138,32 @@ COMMENT ON FUNCTION sta._plan_nodes(jsonb) IS
   'Flatten an EXPLAIN (FORMAT JSON) document into one row per plan node.';
 
 ------------------------------------------------------------------------------
+-- EXPLAIN that never raises
+--
+-- sta.explain() refuses anything that is not a plain SELECT.  That is the
+-- right behaviour for an explicit request, but the advisors also run over
+-- a whole pg_stat_statements workload, which contains INSERT, UPDATE,
+-- CREATE and utility statements as well.  _explain_safe() turns those
+-- "cannot be explained" cases into a NULL plan so that one unsupported
+-- statement does not abort the whole report.
+------------------------------------------------------------------------------
+CREATE FUNCTION sta._explain_safe(p_sql text, p_analyze boolean DEFAULT false)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+    RETURN sta.explain(p_sql, p_analyze);
+EXCEPTION WHEN others THEN
+    RETURN NULL;
+END
+$$;
+
+COMMENT ON FUNCTION sta._explain_safe(text, boolean) IS
+  'EXPLAIN (FORMAT JSON) of a statement, or NULL when the statement cannot be '
+  'explained (not a SELECT, a syntax error, a missing relation).';
+
+------------------------------------------------------------------------------
 -- Plan advice
 ------------------------------------------------------------------------------
 CREATE FUNCTION sta.plan_advice(
@@ -992,7 +1194,10 @@ DECLARE
     v_plan  jsonb;
     v_nodes jsonb;
 BEGIN
-    v_plan := sta.explain(p_sql, p_analyze);
+    v_plan := sta._explain_safe(p_sql, p_analyze);
+    IF v_plan IS NULL THEN
+        RETURN;
+    END IF;
 
     SELECT COALESCE(jsonb_agg(jsonb_build_object('path', n.node_path, 'node', n.node)), '[]'::jsonb)
       INTO v_nodes
@@ -1458,6 +1663,30 @@ AS $$
               >= (SELECT value FROM sta.threshold WHERE name = 'dead_tuple_ratio')
 
         UNION ALL
+        SELECT 'NEVER_VACUUMED',
+               'LOW', 'HIGH', 25,
+               (t.schema || '.' || t.relname),
+               format('The relation has never been vacuumed, so its visibility map is empty and an '
+                      'index-only scan still has to read the heap'),
+               jsonb_build_object(
+                   'relation',        t.schema || '.' || t.relname,
+                   'reltuples',       t.reltuples,
+                   'n_live_tup',      t.n_live_tup,
+                   'total_bytes',     t.total_bytes,
+                   'last_vacuum',     t.last_vacuum,
+                   'last_autovacuum', t.last_autovacuum),
+               'Run VACUUM (ANALYZE) on the relation.',
+               'A vacuum fills the visibility map, so an index-only scan can return the rows without '
+                 'reading the heap, and it records the free space that the load left behind.',
+               'VACUUM uses I/O and CPU; a VACUUM FULL would lock the table but is not required here.',
+               'vacuum'::text
+        FROM tables t
+        WHERE t.est_rows > 0
+          AND t.last_vacuum IS NULL
+          AND t.last_autovacuum IS NULL
+          AND t.n_dead_tup > 0
+
+        UNION ALL
         SELECT 'NO_PRIMARY_KEY',
                'LOW', 'HIGH', 20,
                (t.schema || '.' || t.relname),
@@ -1762,7 +1991,10 @@ DECLARE
     v_plan  jsonb;
     v_nodes jsonb;
 BEGIN
-    v_plan := sta.explain(p_sql, false);
+    v_plan := sta._explain_safe(p_sql, false);
+    IF v_plan IS NULL THEN
+        RETURN;
+    END IF;
 
     SELECT COALESCE(jsonb_agg(jsonb_build_object('path', n.node_path, 'node', n.node)), '[]'::jsonb)
       INTO v_nodes
@@ -1793,7 +2025,25 @@ BEGIN
                rs.node,
                a.attnum AS colid,
                a.attname AS colname,
-               (rs.node->>'Filter' ~ ('\y' || a.attname || '\y[[:space:]]*=')) AS has_equality,
+               -- The function that is applied to the column in the filter, if
+               -- there is one.  A column that is compared inside lower() or
+               -- upper() needs an index on the expression, not on the column.
+               -- The argument of the call is taken out of the filter first,
+               -- because the filter of the plan carries the casts and the
+               -- qualification of the column
+               -- ("lower((orders.customer_name)::text)").
+               CASE
+                   WHEN lower(coalesce(substring(rs.node->>'Filter' from
+                        '\ylower\s*\(([^()]*(\([^()]*\))?[^()]*)\)'), ''))
+                        ~ ('\y' || regexp_replace(a.attname, '[^A-Za-z0-9_]', '', 'g') || '\y')
+                   THEN 'lower'
+                   WHEN lower(coalesce(substring(rs.node->>'Filter' from
+                        '\yupper\s*\(([^()]*(\([^()]*\))?[^()]*)\)'), ''))
+                        ~ ('\y' || regexp_replace(a.attname, '[^A-Za-z0-9_]', '', 'g') || '\y')
+                   THEN 'upper'
+                   ELSE NULL
+               END AS expr_func,
+               (rs.node->>'Filter' ~ ('\y' || a.attname || '\y[^=<>!]*=')) AS plain_equality,
                position(' ' || a.attname || ' ' in rs.node->>'Filter') AS filter_pos
         FROM resolved rs
         JOIN pg_attribute a
@@ -1804,7 +2054,8 @@ BEGIN
           AND rs.est_rows >= (SELECT value FROM sta.threshold WHERE name = 'seq_scan_min_rows')
     ),
     usable AS (
-        SELECT c.*
+        SELECT c.*,
+               (c.plain_equality OR c.expr_func IS NOT NULL) AS has_equality
         FROM cols c
         WHERE NOT EXISTS (
             SELECT 1
@@ -1814,11 +2065,19 @@ BEGIN
               AND k.ord = 1
               AND k.attnum = c.colid
         )
+          AND NOT EXISTS (
+                SELECT 1
+                FROM pg_index i
+                WHERE i.indrelid = c.oid
+                  AND c.expr_func IS NOT NULL
+                  AND pg_get_indexdef(i.indexrelid) ~ ('\y' || c.expr_func || '\s*\(\s*'
+                       || regexp_replace(c.colname, '[^A-Za-z0-9_]', '', 'g') || '\s*\)')
+          )
     ),
     singles AS (
         SELECT DISTINCT ON (u.oid, u.colname)
                u.oid, u.schema, u.relname, u.reltuples, u.est_rows, u.total_bytes, u.node,
-               u.colname, u.has_equality
+               u.colname, u.has_equality, u.expr_func
         FROM usable u
         ORDER BY u.oid, u.colname, u.has_equality DESC
     ),
@@ -1830,7 +2089,11 @@ BEGIN
                u.est_rows,
                u.total_bytes,
                u.node,
-               array_agg(u.colname::text ORDER BY u.filter_pos NULLS LAST, u.colname::text) AS cols
+               array_agg(u.colname::text ORDER BY u.filter_pos NULLS LAST, u.colname::text) AS cols,
+               array_agg(CASE WHEN u.expr_func IS NOT NULL
+                              THEN format('%s(%s)', u.expr_func, u.colname)
+                              ELSE u.colname::text END
+                         ORDER BY u.filter_pos NULLS LAST, u.colname::text) AS exprs
         FROM usable u
         WHERE u.has_equality
         GROUP BY u.oid, u.schema, u.relname, u.reltuples, u.est_rows, u.total_bytes, u.node
@@ -1838,16 +2101,36 @@ BEGIN
     ),
     proposals AS (
         SELECT s.schema || '.' || s.relname AS relation,
-               ARRAY[s.colname::text] AS columns,
+               CASE WHEN s.expr_func IS NOT NULL
+                    THEN ARRAY[format('%s(%s)', s.expr_func, s.colname)]
+                    ELSE ARRAY[s.colname::text] END AS columns,
                format('CREATE INDEX CONCURRENTLY %s ON %s.%s (%s);',
-                      left(lower('idx_' || s.relname || '_' || s.colname), 63),
-                      s.schema, s.relname, s.colname) AS suggested_ddl,
-               format('The plan scans %s sequentially with the filter %s; the column %s is a real column '
-                      'of the relation and is not the leading column of any existing index',
-                      s.relname, COALESCE(s.node->>'Filter', '<none>'), s.colname) AS rationale,
-               format('The scan currently reads about %s rows and returns about %s; an index on (%s) '
-                      'is expected to read only the matching rows',
-                      s.est_rows, COALESCE(s.node->>'Plan Rows', 'unknown'), s.colname) AS estimated_benefit,
+                      left(lower('idx_' || s.relname || '_'
+                                 || CASE WHEN s.expr_func IS NOT NULL
+                                         THEN s.colname || '_' || s.expr_func
+                                         ELSE s.colname END), 63),
+                      s.schema, s.relname,
+                      CASE WHEN s.expr_func IS NOT NULL
+                           THEN format('%s(%s)', s.expr_func, s.colname)
+                           ELSE s.colname END) AS suggested_ddl,
+               CASE WHEN s.expr_func IS NOT NULL
+                    THEN format('The plan scans %s sequentially with the filter %s; the predicate applies '
+                                '%s() to %s, so only an index on the expression %s(%s) can serve it',
+                                s.relname, COALESCE(s.node->>'Filter', '<none>'),
+                                s.expr_func, s.colname, s.expr_func, s.colname)
+                    ELSE format('The plan scans %s sequentially with the filter %s; the column %s is a real column '
+                                'of the relation and is not the leading column of any existing index',
+                                s.relname, COALESCE(s.node->>'Filter', '<none>'), s.colname)
+               END AS rationale,
+               CASE WHEN s.expr_func IS NOT NULL
+                    THEN format('The scan currently reads about %s rows and returns about %s; an index on '
+                                '(%s(%s)) is expected to read only the matching rows',
+                                s.est_rows, COALESCE(s.node->>'Plan Rows', 'unknown'),
+                                s.expr_func, s.colname)
+                    ELSE format('The scan currently reads about %s rows and returns about %s; an index on (%s) '
+                                'is expected to read only the matching rows',
+                                s.est_rows, COALESCE(s.node->>'Plan Rows', 'unknown'), s.colname)
+               END AS estimated_benefit,
                'Each index adds storage and slows down INSERT/UPDATE/DELETE on the relation.' AS estimated_cost,
                CASE WHEN s.has_equality AND s.est_rows >= 10000 THEN 'HIGH'
                     WHEN s.has_equality THEN 'MEDIUM'
@@ -1860,7 +2143,7 @@ BEGIN
                       left(lower('idx_' || c.relname || '_'
                                  || regexp_replace(array_to_string(c.cols, '_'), '[^a-z0-9_]', '', 'g')),
                            63),
-                      c.schema, c.relname, array_to_string(c.cols, ', ')),
+                      c.schema, c.relname, array_to_string(c.exprs, ', ')),
                format('The plan scans %s sequentially with the filter %s; the equality columns %s can be '
                       'combined in a composite index',
                       c.relname, COALESCE(c.node->>'Filter', '<none>'), array_to_string(c.cols, ', ')),
@@ -1887,6 +2170,1390 @@ $$;
 
 COMMENT ON FUNCTION sta.index_advice(text) IS
   'Index candidates for a statement, derived from the filters of sequential scans in its plan.';
+
+------------------------------------------------------------------------------
+-- SQL formatting
+--
+-- The rewritten statements have to be complete and readable, because they
+-- are meant to be pasted into a terminal.  The formatter only inserts line
+-- breaks and spaces between the tokens of a statement: every string
+-- literal, quoted identifier and dollar quoted string is copied verbatim, so
+-- the result parses exactly like the input.
+------------------------------------------------------------------------------
+CREATE FUNCTION sta._format_sql(p_sql text)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_tokens   text[]    := ARRAY[]::text[];
+    v_depths   integer[] := ARRAY[]::integer[];
+    v_depth    integer   := 0;
+    v_i        integer;
+    v_len      integer;
+    v_ch       text;
+    v_word     text;
+    v_tag      text;
+    v_end      integer;
+    v_body     integer;
+    v_out      text      := '';
+    v_line     text      := '';
+    v_kw       text;
+    v_n        integer;
+    v_j        integer;
+    v_tok      text;
+    v_consumed integer;
+    v_prev     text;
+    v_prev_tok text;
+    v_keywords constant text[] := ARRAY[
+        'all','and','any','as','asc','between','by','case','distinct','else',
+        'end','except','exists','for','from','group','having','in','intersect',
+        'into','is','like','limit','not','null','offset','on','or','order',
+        'returning','select','set','some','then','union','using','values',
+        'when','where','with'
+    ];
+    v_breaks constant text[] := ARRAY[
+        'select','from','where','group by','having','order by','limit','offset',
+        'union','union all','intersect','except','join','left join',
+        'right join','full join','inner join','cross join','outer join',
+        'natural join','returning','values','set'
+    ];
+BEGIN
+    IF p_sql IS NULL OR btrim(p_sql) = '' THEN
+        RETURN p_sql;
+    END IF;
+
+    ------------------------------------------------------------------
+    -- 1. Split the statement into tokens.
+    ------------------------------------------------------------------
+    v_len := length(p_sql);
+    v_i := 1;
+    WHILE v_i <= v_len LOOP
+        v_ch := substr(p_sql, v_i, 1);
+
+        IF v_ch ~ '\s' THEN
+            v_i := v_i + 1;
+            CONTINUE;
+        END IF;
+
+        -- A single quoted literal, with the doubled quote escape.
+        IF v_ch = '''' THEN
+            v_word := v_ch;
+            v_i := v_i + 1;
+            WHILE v_i <= v_len LOOP
+                v_ch := substr(p_sql, v_i, 1);
+                v_word := v_word || v_ch;
+                v_i := v_i + 1;
+                IF v_ch = '''' THEN
+                    IF v_i <= v_len AND substr(p_sql, v_i, 1) = '''' THEN
+                        v_word := v_word || '''';
+                        v_i := v_i + 1;
+                    ELSE
+                        EXIT;
+                    END IF;
+                END IF;
+            END LOOP;
+            v_tokens := array_append(v_tokens, v_word);
+            v_depths := array_append(v_depths, v_depth);
+            CONTINUE;
+        END IF;
+
+        -- A quoted identifier.
+        IF v_ch = '"' THEN
+            v_word := v_ch;
+            v_i := v_i + 1;
+            WHILE v_i <= v_len LOOP
+                v_ch := substr(p_sql, v_i, 1);
+                v_word := v_word || v_ch;
+                v_i := v_i + 1;
+                EXIT WHEN v_ch = '"';
+            END LOOP;
+            v_tokens := array_append(v_tokens, v_word);
+            v_depths := array_append(v_depths, v_depth);
+            CONTINUE;
+        END IF;
+
+        -- A dollar quoted string.
+        IF v_ch = '$' AND substr(p_sql, v_i) ~ '^\$[A-Za-z_0-9]*\$' THEN
+            v_tag := regexp_match(substr(p_sql, v_i), '^\$[A-Za-z_0-9]*\$')[1];
+            v_body := v_i + length(v_tag);
+            v_end := position(v_tag IN substr(p_sql, v_body));
+            IF v_end = 0 THEN
+                v_word := substr(p_sql, v_i);
+                v_i := v_len + 1;
+            ELSE
+                v_word := substr(p_sql, v_i, (v_body - v_i) + v_end - 1 + length(v_tag));
+                v_i := v_body + v_end - 1 + length(v_tag);
+            END IF;
+            v_tokens := array_append(v_tokens, v_word);
+            v_depths := array_append(v_depths, v_depth);
+            CONTINUE;
+        END IF;
+
+        -- A word.
+        IF v_ch ~ '[A-Za-z_0-9$]' THEN
+            v_word := '';
+            WHILE v_i <= v_len AND substr(p_sql, v_i, 1) ~ '[A-Za-z_0-9$]' LOOP
+                v_word := v_word || substr(p_sql, v_i, 1);
+                v_i := v_i + 1;
+            END LOOP;
+            v_tokens := array_append(v_tokens, v_word);
+            v_depths := array_append(v_depths, v_depth);
+            CONTINUE;
+        END IF;
+
+        -- Punctuation.  The operators that consist of two characters are
+        -- one token, so that "::", ">=" and "<>" survive the formatting.
+        IF substr(p_sql, v_i, 2) IN ('::', '>=', '<=', '<>', '!=', '||', '->>', '->')
+           THEN
+            v_tokens := array_append(v_tokens, substr(p_sql, v_i, 2));
+            v_depths := array_append(v_depths, v_depth);
+            v_i := v_i + 2;
+            CONTINUE;
+        END IF;
+
+        v_tokens := array_append(v_tokens, v_ch);
+        v_depths := array_append(v_depths, v_depth);
+        IF v_ch = '(' THEN
+            v_depth := v_depth + 1;
+        ELSIF v_ch = ')' THEN
+            v_depth := greatest(v_depth - 1, 0);
+        END IF;
+        v_i := v_i + 1;
+    END LOOP;
+
+    ------------------------------------------------------------------
+    -- 2. Put the tokens back together, one clause per line.
+    ------------------------------------------------------------------
+    v_n := coalesce(array_length(v_tokens, 1), 0);
+    v_j := 1;
+    WHILE v_j <= v_n LOOP
+        v_tok := v_tokens[v_j];
+        v_kw := lower(v_tok);
+        v_consumed := 1;
+
+        -- Multi word keywords have to be recognised as a whole.
+        IF v_kw IN ('group', 'order') AND v_j + 1 <= v_n
+           AND lower(v_tokens[v_j + 1]) = 'by' THEN
+            v_kw := v_kw || ' by';
+            v_consumed := 2;
+        ELSIF v_kw = 'union' AND v_j + 1 <= v_n
+              AND lower(v_tokens[v_j + 1]) = 'all' THEN
+            v_kw := 'union all';
+            v_consumed := 2;
+        ELSIF v_kw IN ('left', 'right', 'full', 'inner', 'cross', 'natural', 'outer')
+              AND v_j + 1 <= v_n THEN
+            IF lower(v_tokens[v_j + 1]) = 'join' THEN
+                v_kw := v_kw || ' join';
+                v_consumed := 2;
+            ELSIF lower(v_tokens[v_j + 1]) = 'outer' AND v_j + 2 <= v_n
+                  AND lower(v_tokens[v_j + 2]) = 'join' THEN
+                v_kw := v_kw || ' outer join';
+                v_consumed := 3;
+            END IF;
+        END IF;
+
+        -- A clause starts on its own line.
+        IF v_depths[v_j] = 0 AND v_kw = ANY (v_breaks) THEN
+            IF btrim(v_line) <> '' THEN
+                v_out := v_out || rtrim(v_line) || E'\n';
+            END IF;
+            v_line := '';
+        END IF;
+
+        -- The separator in front of the token.
+        IF btrim(v_line) <> '' THEN
+            v_prev := lower(right(rtrim(v_line), 1));
+            -- The token in front of this one decides whether a parenthesis
+            -- starts a sub-expression (NOT EXISTS (...)) or is the argument
+            -- list of a function (count(*)).
+            v_prev_tok := CASE WHEN v_j > 1
+                                THEN lower(v_tokens[v_j - 1])
+                                ELSE '' END;
+            IF v_tok IN (',', ')', ';', '.') THEN
+                NULL;   -- no space in front of these
+            ELSIF v_prev = '(' OR v_prev = '.' THEN
+                NULL;   -- no space after an opening parenthesis or a dot
+            -- A parenthesis that follows a keyword starts a sub-expression
+            -- ("IN (...)", "EXISTS (...)"); a parenthesis that follows a
+            -- name is the argument list of a function ("count(*)").
+            -- "<> ALL" is the test for "is not one of": the value has to
+            -- differ from every element of the list.
+            ELSIF v_tok = '(' AND v_prev_tok <> ALL (v_keywords) THEN
+                NULL;   -- a function call: count(*)
+            ELSE
+                v_line := v_line || ' ';
+            END IF;
+        END IF;
+
+        IF v_consumed = 1 THEN
+            v_line := v_line || v_tok;
+        ELSIF v_consumed = 2 THEN
+            v_line := v_line || v_tok || ' ' || v_tokens[v_j + 1];
+        ELSE
+            v_line := v_line || v_tok || ' ' || v_tokens[v_j + 1]
+                      || ' ' || v_tokens[v_j + 2];
+        END IF;
+
+        -- A column list reads better one column per line.
+        IF v_tok = ',' AND v_depths[v_j] = 0 THEN
+            v_out := v_out || rtrim(v_line) || E'\n';
+            v_line := '       ';
+        END IF;
+
+        v_j := v_j + v_consumed;
+    END LOOP;
+
+    v_out := v_out || rtrim(v_line);
+    RETURN v_out;
+END
+$$;
+
+COMMENT ON FUNCTION sta._format_sql(text) IS
+  'Lay a SQL statement out with one clause per line, without changing its meaning.';
+
+------------------------------------------------------------------------------
+-- SQL rewrite advice
+--
+-- The rewrite advisor reads the text of a statement and reports the places
+-- where the same answer can be produced in a way that the planner can use
+-- better: a star projection, a disjunction that could be an IN list, a
+-- function on the filtered column, a cast on the wrong side of the
+-- comparison, a leading wildcard, a NOT IN with a subquery, a UNION that
+-- removes duplicates, and an OFFSET that walks the whole result set.
+--
+-- The advisor never applies a rewrite and it never changes the meaning of
+-- a statement silently.  Every rule states the assumption the rewrite
+-- depends on, and the rules whose rewrite is not semantically identical
+-- say so in the finding text.
+--
+-- The rewritten statement is always returned next to the original one, so
+-- that the two can be compared before anything is changed.
+------------------------------------------------------------------------------
+
+-- The relations a statement reads from.
+CREATE FUNCTION sta._sql_relations(p_sql text)
+RETURNS text[]
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $$
+    SELECT COALESCE(array_agg(DISTINCT m[1]), ARRAY[]::text[])
+    FROM regexp_matches(p_sql,
+                        '\m(?:from|join)\s+([A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?)',
+                        'gi') AS m
+$$;
+
+COMMENT ON FUNCTION sta._sql_relations(text) IS
+  'The relations named after FROM and JOIN in a piece of SQL text.';
+
+-- The relations of the outermost query of a piece of SQL text.  The
+-- relations of a subquery are at a parenthesis depth greater than zero and
+-- are therefore not returned.  The helper is used to decide whether a
+-- SELECT * can be expanded: when the outer query names exactly one
+-- relation, the star can only refer to that relation.
+CREATE FUNCTION sta._sql_outer_relations(p_sql text)
+RETURNS text[]
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+AS $$
+DECLARE
+    v_i      integer;
+    v_ch     text;
+    v_depth  integer := 0;
+    v_in_str boolean := false;
+    v_match  text[];
+    v_out    text[] := ARRAY[]::text[];
+BEGIN
+    FOR v_i IN 1..length(p_sql) LOOP
+        v_ch := substr(p_sql, v_i, 1);
+
+        IF v_in_str THEN
+            IF v_ch = '''' THEN
+                -- A doubled quote is an escaped quote, not the end of the
+                -- literal.
+                IF substr(p_sql, v_i + 1, 1) = '''' THEN
+                    v_i := v_i + 1;
+                ELSE
+                    v_in_str := false;
+                END IF;
+            END IF;
+            CONTINUE;
+        END IF;
+
+        IF v_ch = '''' THEN
+            v_in_str := true;
+        ELSIF v_ch = '(' THEN
+            v_depth := v_depth + 1;
+        ELSIF v_ch = ')' THEN
+            v_depth := v_depth - 1;
+        ELSIF v_depth = 0 THEN
+            v_match := regexp_match(substr(p_sql, v_i),
+                '^\s*(?:from|join)\s+([A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?)',
+                'i');
+            IF v_match IS NOT NULL THEN
+                v_out := array_append(v_out, v_match[1]);
+            END IF;
+        END IF;
+    END LOOP;
+
+    RETURN COALESCE(ARRAY(SELECT DISTINCT unnest(v_out)), ARRAY[]::text[]);
+END
+$$;
+
+COMMENT ON FUNCTION sta._sql_outer_relations(text) IS
+  'The relations of the outermost query of a piece of SQL text.';
+
+-- The name of a relation without its schema.
+CREATE FUNCTION sta._sql_relname(p_rel text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT CASE WHEN position('.' IN p_rel) > 0
+                THEN split_part(p_rel, '.', 2)
+                ELSE p_rel END
+$$;
+
+COMMENT ON FUNCTION sta._sql_relname(text) IS
+  'The name of a relation without the schema it was qualified with.';
+
+-- The alias of a relation, when the text that follows the relation name
+-- starts with one.
+CREATE FUNCTION sta._sql_first_word_alias(p_rest text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT CASE
+             WHEN m[1] IS NULL THEN NULL
+             WHEN lower(m[1]) = ANY (ARRAY[
+                    'where','group','order','having','limit','offset','join','inner',
+                    'left','right','full','cross','on','union','except','intersect',
+                    'returning','set','values','and','or','not','is','in','like',
+                    'between','from','select','as','fetch','for','window','natural',
+                    'lateral','using','with','table','when','then','else','end'])
+             THEN NULL
+             ELSE m[1]
+           END
+      FROM regexp_matches(p_rest, '^\s*([A-Za-z_][A-Za-z0-9_$]*)', 'i') AS m
+     LIMIT 1
+$$;
+
+COMMENT ON FUNCTION sta._sql_first_word_alias(text) IS
+  'The alias that follows a relation name, or NULL when the next word is a keyword.';
+
+-- The first relation of a statement, with the alias it is used under.
+CREATE FUNCTION sta._sql_first_from(p_sql text)
+RETURNS TABLE (relation text, alias text)
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT m[1],
+           CASE WHEN m[2] IS NULL
+                     OR lower(m[2]) = ANY (ARRAY[
+                            'where','group','order','having','limit','offset','join','inner',
+                            'left','right','full','cross','on','union','except','intersect',
+                            'returning','set','values','and','or','not','is','in','like',
+                            'between','from','select','as','fetch','for','window','natural',
+                            'lateral','using','with','table','when','then','else','end'])
+                THEN NULL
+                ELSE m[2]
+           END
+      FROM regexp_matches(p_sql,
+             '\mfrom\s+([A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?)'
+             '(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_$]*))?',
+             'gi') AS m
+     LIMIT 1
+$$;
+
+COMMENT ON FUNCTION sta._sql_first_from(text) IS
+  'The first relation of a statement and the alias it is used under.';
+
+-- The OID of a relation, as it is named in a statement.
+--
+-- to_regclass() resolves the name with the search path of the session, and
+-- it is what a statement really means.  A statement that names a relation
+-- that is not in the search path -- a table of another schema that the
+-- caller qualifies, or a table of a schema that the session does not
+-- include -- is still worth analysing, so the function falls back to a
+-- relation of the same name in any other schema.
+CREATE FUNCTION sta._sql_relid(p_rel text)
+RETURNS oid
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT COALESCE(
+        CASE WHEN p_rel ~ '^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$'
+             THEN pg_catalog.to_regclass(p_rel)::oid
+        END,
+        (SELECT c.oid
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = CASE WHEN position('.' IN p_rel) > 0
+                                 THEN split_part(p_rel, '.', 2) ELSE p_rel END
+            AND n.nspname = ANY (current_schemas(false))
+          ORDER BY n.nspname
+          LIMIT 1),
+        (SELECT c.oid
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = CASE WHEN position('.' IN p_rel) > 0
+                                 THEN split_part(p_rel, '.', 2) ELSE p_rel END
+            AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+            AND n.nspname NOT LIKE 'pg_toast%'
+          ORDER BY n.nspname
+          LIMIT 1))
+$$;
+
+COMMENT ON FUNCTION sta._sql_relid(text) IS
+  'The OID of the relation a statement names, or NULL when there is none.';
+
+-- The columns of a relation, in attribute order.
+CREATE FUNCTION sta._sql_relation_columns(p_rel text)
+RETURNS text[]
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT COALESCE(array_agg(a.attname ORDER BY a.attnum), ARRAY[]::text[])
+      FROM pg_attribute a
+     WHERE a.attrelid = sta._sql_relid(p_rel)
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+$$;
+
+COMMENT ON FUNCTION sta._sql_relation_columns(text) IS
+  'The column names of a relation, in attribute order.';
+
+-- The type of a column of a relation, as PostgreSQL spells it.
+CREATE FUNCTION sta._sql_column_type(p_rel text, p_col text)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT format_type(a.atttypid, a.atttypmod)
+      FROM pg_attribute a
+     WHERE a.attrelid = sta._sql_relid(p_rel)
+       AND a.attname = p_col
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+     LIMIT 1
+$$;
+
+COMMENT ON FUNCTION sta._sql_column_type(text, text) IS
+  'The type of a column of a relation, as PostgreSQL spells it.';
+
+-- The DDL of an index on a relation.
+CREATE FUNCTION sta._sql_index_ddl(p_schema text, p_relname text, p_columns text, p_suffix text)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT format('CREATE INDEX CONCURRENTLY %s ON %s.%s (%s);',
+                  left(lower('idx_' || p_relname || '_' || p_suffix), 63),
+                  p_schema, p_relname, p_columns)
+$$;
+
+COMMENT ON FUNCTION sta._sql_index_ddl(text, text, text, text) IS
+  'The CREATE INDEX statement for a relation, with a name that fits into 63 characters.';
+
+-- Whether every stored value of a column already has the case that lower()
+-- or upper() would produce.  The answer decides whether a predicate of the
+-- form lower(col) = 'x' may be rewritten as col = 'x'.
+CREATE FUNCTION sta._sql_values_are_normalized(p_rel text, p_col text, p_func text)
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_schema text;
+    v_name   text;
+    v_rows   bigint;
+    v_ok     boolean;
+BEGIN
+    IF p_rel IS NULL OR p_col IS NULL OR p_func NOT IN ('lower', 'upper') THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT n.nspname, c.relname, c.reltuples::bigint
+      INTO v_schema, v_name, v_rows
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = CASE WHEN position('.' IN p_rel) > 0
+                            THEN split_part(p_rel, '.', 2)
+                            ELSE p_rel END
+       AND (position('.' IN p_rel) = 0 OR n.nspname = split_part(p_rel, '.', 1))
+       AND (position('.' IN p_rel) > 0 OR n.nspname = ANY (current_schemas(false)))
+       AND c.relkind IN ('r', 'm', 'p')
+     LIMIT 1;
+
+    IF v_name IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    -- The check reads the whole relation, so it is only made when the
+    -- relation is small enough for the scan to be quick.  A relation that
+    -- is too large is reported as "not known", and the safe advice is used.
+    IF v_rows > 10000000 THEN
+        RETURN NULL;
+    END IF;
+
+    EXECUTE format('SELECT NOT EXISTS (SELECT 1 FROM %I.%I WHERE %I <> %s(%I) LIMIT 1)',
+                   v_schema, v_name, p_col, p_func, p_col)
+       INTO v_ok;
+    RETURN v_ok;
+EXCEPTION WHEN others THEN
+    RETURN NULL;
+END
+$$;
+
+COMMENT ON FUNCTION sta._sql_values_are_normalized(text, text, text) IS
+  'Whether every value of a column is already in the case lower() or upper() produces, '
+  'or NULL when that cannot be determined cheaply.';
+
+CREATE FUNCTION sta.rewrite_advice(p_sql text)
+RETURNS TABLE (
+    finding_id       integer,
+    category         text,
+    severity         text,
+    confidence       text,
+    impact_score     integer,
+    object_name      text,
+    pattern          text,
+    original_sql     text,
+    rewritten_sql    text,
+    finding          text,
+    finding_text     text,
+    evidence         jsonb,
+    recommendation   text,
+    expected_benefit text,
+    estimated_cost   text,
+    validation_steps text[]
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_sql      text := sta._raw_statement(p_sql);
+    v_orig     text;
+    v_plan     jsonb;
+    v_nodes    jsonb := '[]'::jsonb;
+    v_rels     text[];
+    v_all_cols text[];
+    v_rel      text;
+    v_alias    text;
+    v_outer    text[];
+    v_cols     text[];
+    v_m        text[];
+    v_new      text;
+    v_col      text;
+    v_col2     text;
+    v_lit      text;
+    v_type     text;
+    v_qual     text;
+    v_outer_qual text;
+    v_qual2    text;
+    v_outer_ref text;
+    v_inner_ref text;
+    v_inner_rest text;
+    v_inner_tail text;
+    v_wpos     integer;
+    v_func    text;
+    v_schema  text;
+    v_relname text;
+    v_ddl     text;
+    v_safe    boolean;
+    v_r       text;
+    v_findings jsonb := '[]'::jsonb;
+    v_n_union  integer;
+    v_n_all    integer;
+    v_key      text;
+    v_key_dir  text;
+    v_base     text;
+    v_limit    integer;
+    v_offset   integer;
+    v_cut      integer;
+    v_pos      integer;
+    v_where    integer;
+    v_cond     text;
+    v_trgm     boolean;
+BEGIN
+    IF p_sql IS NULL OR btrim(p_sql) = '' THEN
+        RETURN;
+    END IF;
+
+    v_orig := sta._format_sql(v_sql);
+
+    -- The plan is evidence, not a requirement: the rewrite rules work on
+    -- the text of the statement, and a statement that cannot be planned
+    -- (a relation that does not exist, a syntax error) still deserves a
+    -- rewrite.
+    BEGIN
+        v_plan := sta.explain(p_sql, false);
+        SELECT COALESCE(jsonb_agg(DISTINCT n.node->>'Node Type'), '[]'::jsonb)
+          INTO v_nodes
+          FROM sta._plan_nodes(v_plan) n;
+    EXCEPTION WHEN others THEN
+        v_plan := NULL;
+    END;
+
+    v_rels := sta._sql_relations(v_sql);
+
+    SELECT COALESCE(array_agg(DISTINCT c), ARRAY[]::text[])
+      INTO v_all_cols
+      FROM unnest(v_rels) r,
+           LATERAL unnest(sta._sql_relation_columns(r)) c;
+
+    ------------------------------------------------------------------
+    -- 1. SELECT *
+    ------------------------------------------------------------------
+    IF v_sql ~* '\yselect\s+\*' THEN
+        v_outer := sta._sql_outer_relations(v_sql);
+        IF array_length(v_outer, 1) = 1 THEN
+            v_cols := sta._sql_relation_columns(v_outer[1]);
+        END IF;
+        IF array_length(v_cols, 1) IS NOT NULL THEN
+            v_new := regexp_replace(v_sql, '(\yselect\s+)\*',
+                                    '\1' || array_to_string(v_cols, ', '), 'i');
+            IF v_new IS DISTINCT FROM v_sql THEN
+                v_findings := v_findings || jsonb_build_array(jsonb_build_object(
+                    'category', 'rewrite',
+                    'severity', 'MEDIUM',
+                    'confidence', 'HIGH',
+                    'impact_score', 50,
+                    'object_name', v_outer[1],
+                    'pattern', 'SELECT_STAR',
+                    'original_sql', v_orig,
+                    'rewritten_sql', sta._format_sql(v_new),
+                    'finding', 'SELECT_STAR',
+                    'finding_text', format(
+                        'The statement reads every column of %s, including the columns it does not use. '
+                        'The relation has %s columns, so every row is widened on the way out of the server.',
+                        v_outer[1], array_length(v_cols, 1)),
+                    'evidence', jsonb_build_object(
+                        'relation', v_outer[1],
+                        'column_count', array_length(v_cols, 1),
+                        'columns', to_jsonb(v_cols),
+                        'plan_nodes', v_nodes),
+                    'recommendation', format(
+                        'Name the columns the statement actually uses: %s',
+                        left(array_to_string(v_cols, ', '), 300)),
+                    'expected_benefit', 'Fewer bytes are read and transferred for every row, and the '
+                        'relation may become covered by an index that holds only the selected columns.',
+                    'estimated_cost', 'The statement gets longer and has to be kept in step with the '
+                        'relation whenever a column is added, dropped or renamed.',
+                    'validation_steps', to_jsonb(sta.validation_steps('rewrite'))));
+            END IF;
+        END IF;
+    END IF;
+
+    ------------------------------------------------------------------
+    -- 2. x = a OR x = b  ->  x IN (a, b)
+    ------------------------------------------------------------------
+    FOR v_m IN
+        SELECT m FROM regexp_matches(v_sql,
+             '\y([A-Za-z_][A-Za-z0-9_$]*)\s*=\s*(''[^'']*''|[-+]?[0-9]*\.?[0-9]+)'
+             '\s+or\s+\1\s*=\s*(''[^'']*''|[-+]?[0-9]*\.?[0-9]+)', 'gi') AS m
+    LOOP
+        v_col := v_m[1];
+        CONTINUE WHEN v_all_cols IS NOT NULL AND NOT (v_col = ANY (v_all_cols));
+        v_new := regexp_replace(v_sql,
+             '\y([A-Za-z_][A-Za-z0-9_$]*)\s*=\s*(''[^'']*''|[-+]?[0-9]*\.?[0-9]+)'
+             '\s+or\s+\1\s*=\s*(''[^'']*''|[-+]?[0-9]*\.?[0-9]+)',
+             '\1 IN (\2, \3)', 'gi');
+        IF v_new IS DISTINCT FROM v_sql THEN
+            v_findings := v_findings || jsonb_build_array(jsonb_build_object(
+                'category', 'rewrite',
+                'severity', 'MEDIUM',
+                'confidence', 'HIGH',
+                'impact_score', 50,
+                'object_name', v_col,
+                'pattern', 'OR_TO_IN',
+                'original_sql', v_orig,
+                'rewritten_sql', sta._format_sql(v_new),
+                'finding', 'OR_TO_IN',
+                'finding_text', format(
+                    'The statement tests %s twice with an OR.  Two equality tests on the same column are '
+                    'rewritten by the planner into a single index lookup, while a disjunction usually '
+                    'becomes a bitmap scan or a filter that has to read the whole relation.', v_col),
+                'evidence', jsonb_build_object(
+                    'column', v_col,
+                    'matched', v_m[1] || ' = ' || v_m[2] || ' OR ' || v_col || ' = ' || v_m[3],
+                    'plan_nodes', v_nodes),
+                'recommendation', format('Replace the disjunction with an IN list on %s.', v_col),
+                'expected_benefit', format(
+                    'The planner can use one index lookup on %s instead of a filter over the whole relation.',
+                    v_col),
+                'estimated_cost', format(
+                    'None: the rewrite returns exactly the same rows, including the rows where %s is NULL.',
+                    v_col),
+                'validation_steps', to_jsonb(sta.validation_steps('rewrite'))));
+            EXIT;   -- one report per statement is enough
+        END IF;
+    END LOOP;
+
+    ------------------------------------------------------------------
+    -- 3. x NOT IN (SELECT ...)  ->  NOT EXISTS (...)
+    ------------------------------------------------------------------
+    SELECT relation, alias INTO v_rel, v_alias FROM sta._sql_first_from(v_sql);
+    IF v_rel IS NOT NULL THEN
+        v_qual := COALESCE(v_alias, sta._sql_relname(v_rel));
+        FOR v_m IN
+            SELECT m FROM regexp_matches(v_sql,
+                 '\y((?:[A-Za-z_][A-Za-z0-9_$]*\.)?)([A-Za-z_][A-Za-z0-9_$]*)\s+not\s+in\s*\(\s*select\s+((?:[A-Za-z_][A-Za-z0-9_$]*\.)?)([A-Za-z_][A-Za-z0-9_$]*)'
+                 '\s+from\s+([A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?)\s*([^)]*)\)', 'gi') AS m
+        LOOP
+            v_col  := v_m[2];
+            v_col2 := v_m[4];
+
+            -- The outer column keeps the qualifier the statement uses.  When
+            -- it has none, the alias of the outer relation is used, and when
+            -- the column does not belong to that relation it stays bare.
+            IF v_m[1] <> '' THEN
+                v_outer_qual := left(v_m[1], length(v_m[1]) - 1);
+            ELSE
+                v_outer_qual := COALESCE(v_alias, sta._sql_relname(v_rel));
+            END IF;
+            IF v_outer_qual IS NOT NULL
+               AND v_col = ANY (sta._sql_relation_columns(v_rel)) THEN
+                v_outer_ref := v_outer_qual || '.' || v_col;
+            ELSE
+                v_outer_ref := v_col;
+            END IF;
+
+            -- The inner column is qualified with the qualifier of the
+            -- subquery when it has one, with the alias of the inner relation
+            -- when the subquery gives it one, and with the name of the inner
+            -- relation otherwise.
+            v_qual2 := COALESCE(NULLIF(left(v_m[3], length(v_m[3]) - 1), ''),
+                                 sta._sql_first_word_alias(v_m[6]),
+                                 sta._sql_relname(v_m[5]));
+            v_inner_ref := v_qual2 || '.' || v_col2;
+
+            -- The rest of the subquery: its alias, its WHERE clause and
+            -- everything that follows it.
+            v_inner_rest := btrim(v_m[6]);
+
+            -- A subquery that has a GROUP BY, an ORDER BY, a LIMIT or an
+            -- OFFSET of its own does not return the same rows when it is
+            -- correlated, so the rule leaves such a statement alone.
+            CONTINUE WHEN v_inner_rest ~* '\m(group\s+by|order\s+by|limit|offset)\b';
+
+            -- The pattern stops at the first closing parenthesis, so a rest
+            -- that still holds an opening parenthesis means that the
+            -- subquery was cut in the middle.  The rewrite would not be
+            -- valid SQL, so the statement is left alone.
+            CONTINUE WHEN position('(' IN v_inner_rest) > 0;
+
+            -- The correlated condition goes at the end of the WHERE clause
+            -- of the subquery.  A subquery without a WHERE clause gets one.
+            IF v_inner_rest = '' THEN
+                v_inner_tail := ' WHERE ' || v_inner_ref || ' = ' || v_outer_ref;
+            ELSIF strpos(lower(v_inner_rest), 'where') > 0 THEN
+                v_inner_tail := ' ' || v_inner_rest || ' AND '
+                               || v_inner_ref || ' = ' || v_outer_ref;
+            ELSE
+                v_inner_tail := ' ' || v_inner_rest || ' WHERE '
+                               || v_inner_ref || ' = ' || v_outer_ref;
+            END IF;
+
+            v_new := regexp_replace(v_sql,
+                 '\y((?:[A-Za-z_][A-Za-z0-9_$]*\.)?)([A-Za-z_][A-Za-z0-9_$]*)\s+not\s+in\s*\(\s*select\s+((?:[A-Za-z_][A-Za-z0-9_$]*\.)?)([A-Za-z_][A-Za-z0-9_$]*)'
+                 '\s+from\s+([A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?)\s*([^)]*)\)',
+                 'NOT EXISTS (SELECT 1 FROM \5' || v_inner_tail || ')', 'i');
+            IF v_new IS DISTINCT FROM v_sql THEN
+                v_findings := v_findings || jsonb_build_array(jsonb_build_object(
+                    'category', 'rewrite',
+                    'severity', 'MEDIUM',
+                    'confidence', 'MEDIUM',
+                    'impact_score', 50,
+                    'object_name', v_rel,
+                    'pattern', 'NOT_IN_TO_NOT_EXISTS',
+                    'original_sql', v_orig,
+                    'rewritten_sql', sta._format_sql(v_new),
+                    'finding', 'NOT_IN_TO_NOT_EXISTS',
+                    'finding_text', format(
+                        'The statement uses NOT IN with a subquery.  NOT IN is evaluated as a hashed '
+                        'anti-join over the whole subquery, while NOT EXISTS stops at the first matching '
+                        'row and can use an index.  The two are not identical: NOT IN returns no rows at '
+                        'all when the subquery produces a single NULL, whereas NOT EXISTS does not.  The '
+                        'rewrite is therefore offered with the assumption that %s contains no NULL, or that '
+                        'the difference does not matter.', v_qual2),
+                    'evidence', jsonb_build_object(
+                        'outer_column', v_outer_ref,
+                        'subquery_column', v_inner_ref,
+                        'subquery_relation', v_m[5],
+                        'outer_relation', v_rel,
+                        'plan_nodes', v_nodes),
+                    'recommendation', format(
+                        'Rewrite the NOT IN as NOT EXISTS and confirm that %s cannot return NULL.',
+                        v_qual2),
+                    'expected_benefit', 'The subquery can stop at the first matching row instead of hashing '
+                        'the whole result set.',
+                    'estimated_cost', 'The NULL semantics change; a query that used to return no rows may '
+                        'now return rows.',
+                    'validation_steps', to_jsonb(sta.validation_steps('rewrite'))));
+                EXIT;
+            END IF;
+        END LOOP;
+    END IF;
+
+    ------------------------------------------------------------------
+    -- 4. lower(col) = 'x'  ->  col = 'x'   (only when it is equivalent)
+    ------------------------------------------------------------------
+    FOR v_m IN
+        SELECT m FROM regexp_matches(v_sql,
+             '\y(lower|upper)\s*\(\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\)\s*=\s*''([^'']*)''', 'gi') AS m
+    LOOP
+        v_col  := v_m[2];
+        v_func := lower(v_m[1]);
+
+        -- The relation that owns the column.
+        v_rel     := NULL;
+        v_schema  := NULL;
+        v_relname := NULL;
+        FOR v_r IN SELECT unnest(v_rels) LOOP
+            IF v_col = ANY (sta._sql_relation_columns(v_r)) THEN
+                v_rel := v_r;
+                EXIT;
+            END IF;
+        END LOOP;
+
+        IF v_rel IS NOT NULL THEN
+            SELECT r.schema, r.relname INTO v_schema, v_relname
+              FROM sta._resolve_relation(sta._sql_relname(v_rel)) r;
+        END IF;
+
+        -- The expression index is the advice that works in every case.
+        IF v_schema IS NOT NULL THEN
+            v_ddl := sta._sql_index_ddl(v_schema, v_relname,
+                                        format('%s(%s)', v_func, v_col),
+                                        v_col || '_' || v_func);
+        ELSE
+            v_ddl := format('CREATE INDEX CONCURRENTLY idx_<relation>_%s_%s ON <schema>.<relation> (%s(%s));',
+                            lower(v_col), v_func, v_func, v_col);
+        END IF;
+
+        -- The statement without the function is only equivalent when every
+        -- stored value already has the case the function produces.
+        v_safe := sta._sql_values_are_normalized(v_rel, v_col, v_func);
+
+        IF v_safe THEN
+            v_new := regexp_replace(v_sql,
+                 '\y(lower|upper)\s*\(\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\)\s*=\s*''([^'']*)''',
+                 '\2 = ' || quote_literal(v_m[3]), 'i');
+        ELSE
+            v_new := v_sql;
+        END IF;
+
+        IF v_new IS DISTINCT FROM v_sql THEN
+            v_findings := v_findings || jsonb_build_array(jsonb_build_object(
+                'category', 'rewrite',
+                'severity', 'HIGH',
+                'confidence', 'HIGH',
+                'impact_score', 70,
+                'object_name', v_col,
+                'pattern', 'NON_SARGABLE_PREDICATE',
+                'original_sql', v_orig,
+                'rewritten_sql', sta._format_sql(v_new),
+                'finding', 'NON_SARGABLE_PREDICATE',
+                'finding_text', format(
+                    'The statement applies %s() to %s before comparing it.  An index on %s cannot be used '
+                    'for that, because the index stores the values of the column and not the result of the '
+                    'function.  Every stored value of %s was checked and is already %s-case, so the '
+                    'function can be dropped from the predicate without changing the result.',
+                    v_func, v_col, v_col, v_col, v_func),
+                'evidence', jsonb_build_object(
+                    'function', v_func,
+                    'column', v_col,
+                    'literal', v_m[3],
+                    'relation', v_rel,
+                    'values_already_normalized', v_safe,
+                    'suggested_ddl', v_ddl,
+                    'plan_nodes', v_nodes),
+                'recommendation', format(
+                    'Drop the function from the predicate, and build the expression index as well: %s',
+                    v_ddl),
+                'expected_benefit', format(
+                    'The predicate becomes sargable, so the index on %s can be used.', v_col),
+                'estimated_cost', 'None: the rewrite returns the same rows, because every stored value '
+                    'was checked.  The expression index adds write overhead on the relation.',
+                'validation_steps', to_jsonb(sta.validation_steps('rewrite'))));
+        ELSE
+            v_findings := v_findings || jsonb_build_array(jsonb_build_object(
+                'category', 'rewrite',
+                'severity', 'HIGH',
+                'confidence', 'HIGH',
+                'impact_score', 70,
+                'object_name', v_col,
+                'pattern', 'NON_SARGABLE_PREDICATE',
+                'original_sql', v_orig,
+                -- There is no rewrite of the predicate that keeps the result
+                -- and makes the index usable: the values are not all in the
+                -- case the function produces, so the statement is returned
+                -- unchanged and the index has to change instead.
+                'rewritten_sql', v_orig,
+                'finding', 'NON_SARGABLE_PREDICATE',
+                'finding_text', format(
+                    'The statement applies %s() to %s before comparing it.  An index on %s cannot be used '
+                    'for that, because the index stores the values of the column and not the result of the '
+                    'function.  The stored values of %s are not all %s-case, so dropping the function from '
+                    'the predicate would change the result and no rewrite of the statement is offered.  The '
+                    'index has to change instead: an index on the expression %s(%s) serves the predicate '
+                    'as it is written.', v_func, v_col, v_col, v_col, v_func, v_func, v_col),
+                'evidence', jsonb_build_object(
+                    'function', v_func,
+                    'column', v_col,
+                    'literal', v_m[3],
+                    'relation', v_rel,
+                    'values_already_normalized', v_safe,
+                    'suggested_ddl', v_ddl,
+                    'plan_nodes', v_nodes),
+                'recommendation', format(
+                    'Keep the predicate and build an index on the expression: %s', v_ddl),
+                'expected_benefit', format(
+                    'The expression index can serve the predicate on %s, so the whole relation does not '
+                    'have to be read.', v_col),
+                'estimated_cost', 'An expression index is larger than a plain index and slows down writes '
+                    'on the relation.',
+                'validation_steps', to_jsonb(sta.validation_steps('rewrite'))));
+        END IF;
+        EXIT;
+    END LOOP;
+
+    ------------------------------------------------------------------
+    -- 5. date(col) = '2024-01-01'  ->  col >= '2024-01-01' AND col < ...
+    ------------------------------------------------------------------
+    FOR v_m IN
+        SELECT m FROM regexp_matches(v_sql,
+             '\ydate\s*\(\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\)\s*=\s*''([0-9]{4}-[0-9]{2}-[0-9]{2})''',
+             'gi') AS m
+    LOOP
+        v_col := v_m[1];
+        v_lit := v_m[2];
+        v_new := regexp_replace(v_sql,
+             '\ydate\s*\(\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\)\s*=\s*''([0-9]{4}-[0-9]{2}-[0-9]{2})''',
+             '\1 >= ' || quote_literal(v_lit) || '::date AND \1 < ('
+                 || quote_literal(v_lit) || '::date + 1)', 'i');
+        IF v_new IS DISTINCT FROM v_sql THEN
+            v_findings := v_findings || jsonb_build_array(jsonb_build_object(
+                'category', 'rewrite',
+                'severity', 'HIGH',
+                'confidence', 'HIGH',
+                'impact_score', 70,
+                'object_name', v_col,
+                'pattern', 'NON_SARGABLE_PREDICATE',
+                'original_sql', v_orig,
+                'rewritten_sql', sta._format_sql(v_new),
+                'finding', 'NON_SARGABLE_PREDICATE',
+                'finding_text', format(
+                    'The statement applies date() to %s before comparing it, so an index on %s cannot be '
+                    'used.  The range from %s to the next day is exactly the same set of rows and can use '
+                    'the index.', v_col, v_col, v_lit),
+                'evidence', jsonb_build_object(
+                    'function', 'date',
+                    'column', v_col,
+                    'literal', v_lit,
+                    'plan_nodes', v_nodes),
+                'recommendation', format('Compare %s with a half-open range instead of a function call.', v_col),
+                'expected_benefit', format(
+                    'The predicate becomes sargable, so the index on %s can be used.', v_col),
+                'estimated_cost', 'None for a date or timestamp column; the range covers exactly one day.',
+                'validation_steps', to_jsonb(sta.validation_steps('rewrite'))));
+            EXIT;
+        END IF;
+    END LOOP;
+
+    ------------------------------------------------------------------
+    -- 6. col::text = '123.45'  ->  col = 123.45
+    ------------------------------------------------------------------
+    FOR v_m IN
+        SELECT m FROM regexp_matches(v_sql,
+             '\y([A-Za-z_][A-Za-z0-9_$]*)\s*::\s*text\s*=\s*''([^'']*)''', 'gi') AS m
+    LOOP
+        v_col := v_m[1];
+        v_lit := v_m[2];
+        v_type := NULL;
+        FOR v_rel IN SELECT unnest(v_rels) LOOP
+            v_type := sta._sql_column_type(v_rel, v_col);
+            EXIT WHEN v_type IS NOT NULL;
+        END LOOP;
+        CONTINUE WHEN v_type IS NULL;
+
+        -- format_type() spells a numeric column as numeric(10,2); only the
+        -- base type decides how the comparison has to be rewritten.
+        v_base := split_part(v_type, '(', 1);
+
+        IF v_base IN ('numeric', 'integer', 'bigint', 'smallint', 'real',
+                      'double precision', 'money')
+           AND v_lit ~ '^-?[0-9]+(\.[0-9]+)?$' THEN
+            v_new := regexp_replace(v_sql,
+                 '\y([A-Za-z_][A-Za-z0-9_$]*)\s*::\s*text\s*=\s*''([^'']*)''',
+                 '\1 = ' || v_lit::numeric::text, 'i');
+        ELSIF v_base IN ('text', 'character varying', 'character', 'varchar',
+                         'bpchar', 'citext') THEN
+            v_new := regexp_replace(v_sql,
+                 '\y([A-Za-z_][A-Za-z0-9_$]*)\s*::\s*text\s*=\s*''([^'']*)''',
+                 '\1 = ' || quote_literal(v_lit), 'i');
+        ELSE
+            CONTINUE;
+        END IF;
+
+        IF v_new IS DISTINCT FROM v_sql THEN
+            v_findings := v_findings || jsonb_build_array(jsonb_build_object(
+                'category', 'rewrite',
+                'severity', 'HIGH',
+                'confidence', 'MEDIUM',
+                'impact_score', 70,
+                'object_name', v_col,
+                'pattern', 'IMPLICIT_CAST',
+                'original_sql', v_orig,
+                'rewritten_sql', sta._format_sql(v_new),
+                'finding', 'IMPLICIT_CAST',
+                'finding_text', format(
+                    'The statement casts %s to text before comparing it.  The cast is applied to every row '
+                    'of the relation and it makes an index on %s unusable, because the index stores the '
+                    'numeric values.  The comparison is only equivalent when the text form of the literal '
+                    'is the canonical form of the number (123.45 is, 1e2 is not).', v_col, v_col),
+                'evidence', jsonb_build_object(
+                    'column', v_col,
+                    'column_type', v_type,
+                    'literal', v_lit,
+                    'plan_nodes', v_nodes),
+                'recommendation', format('Compare %s with a literal of its own type.', v_col),
+                'expected_benefit', format(
+                    'The cast disappears from the plan and the index on %s can be used.', v_col),
+                'estimated_cost', 'A numeric literal is not always spelled the same way as its text form, '
+                    'so the two can select different rows.',
+                'validation_steps', to_jsonb(sta.validation_steps('rewrite'))));
+            EXIT;
+        END IF;
+    END LOOP;
+
+    ------------------------------------------------------------------
+    -- 7. col LIKE '%x%'
+    ------------------------------------------------------------------
+    SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') INTO v_trgm;
+    FOR v_m IN
+        SELECT m FROM regexp_matches(v_sql,
+             '\y([A-Za-z_][A-Za-z0-9_$]*)\s+like\s+''(%[^'']*|[^'']*%)''', 'gi') AS m
+    LOOP
+        v_col := v_m[1];
+
+        -- The relation that owns the column, so that the index can be named
+        -- after it and built on the right schema.
+        v_rel     := NULL;
+        v_schema  := NULL;
+        v_relname := NULL;
+        FOR v_r IN SELECT unnest(v_rels) LOOP
+            IF v_col = ANY (sta._sql_relation_columns(v_r)) THEN
+                v_rel := v_r;
+                EXIT;
+            END IF;
+        END LOOP;
+
+        IF v_rel IS NOT NULL THEN
+            SELECT r.schema, r.relname INTO v_schema, v_relname
+              FROM sta._resolve_relation(sta._sql_relname(v_rel)) r;
+        END IF;
+
+        IF v_schema IS NOT NULL THEN
+            v_ddl := format('CREATE INDEX CONCURRENTLY %s ON %s.%s USING gin (%s gin_trgm_ops);',
+                            left(lower('idx_' || v_relname || '_' || v_col || '_trgm'), 63),
+                            v_schema, v_relname, v_col);
+        ELSE
+            v_ddl := format('CREATE INDEX CONCURRENTLY idx_<relation>_%s_trgm ON <schema>.<relation> USING gin (%s gin_trgm_ops);',
+                            lower(v_col), v_col);
+        END IF;
+
+        v_findings := v_findings || jsonb_build_array(jsonb_build_object(
+            'category', 'rewrite',
+            'severity', 'HIGH',
+            'confidence', 'HIGH',
+            'impact_score', 60,
+            'object_name', v_col,
+            'pattern', 'LEADING_WILDCARD_LIKE',
+            'original_sql', v_orig,
+            -- There is no rewrite of the predicate that makes it sargable: a B-tree index cannot serve a
+            -- pattern that starts with a wildcard.  The statement is returned unchanged and the fix is
+            -- stated in the recommendation.
+            'rewritten_sql', v_orig,
+            'finding', 'LEADING_WILDCARD_LIKE',
+            'finding_text', format(
+                'The pattern on %s starts with a wildcard, so a B-tree index on %s cannot be used and the '
+                'whole relation has to be read.  No rewrite of the predicate can change that; the index has '
+                'to change instead.', v_col, v_col),
+            'evidence', jsonb_build_object(
+                'column', v_col,
+                'relation', v_rel,
+                'pattern', CASE WHEN left(v_m[2], 1) = '%'
+                                THEN v_m[2] ELSE '%' || v_m[2] END,
+                'pg_trgm_available', v_trgm,
+                'suggested_ddl', v_ddl,
+                'plan_nodes', v_nodes),
+            'recommendation', CASE WHEN v_trgm
+                THEN format('Create a trigram index: %s', v_ddl)
+                ELSE format('Install pg_trgm and create a trigram index: CREATE EXTENSION IF NOT EXISTS pg_trgm; %s', v_ddl)
+            END,
+            'expected_benefit', 'The trigram index can serve the pattern without reading the whole relation.',
+            'estimated_cost', 'A trigram index is large and slows down writes on the relation.',
+            'validation_steps', to_jsonb(sta.validation_steps('rewrite'))));
+        CONTINUE;
+    END LOOP;
+
+    ------------------------------------------------------------------
+    -- 8. UNION  ->  UNION ALL
+    ------------------------------------------------------------------
+    SELECT count(*) INTO v_n_union FROM regexp_matches(v_sql, '\yunion\y', 'gi');
+    SELECT count(*) INTO v_n_all   FROM regexp_matches(v_sql, '\yunion\s+all\y', 'gi');
+    IF v_n_union > v_n_all THEN
+        v_new := regexp_replace(v_sql, '\yunion\y(?!\s+all\y)', 'UNION ALL', 'gi');
+        IF v_new IS DISTINCT FROM v_sql THEN
+            v_findings := v_findings || jsonb_build_array(jsonb_build_object(
+                'category', 'rewrite',
+                'severity', 'LOW',
+                'confidence', 'MEDIUM',
+                'impact_score', 30,
+                'object_name', NULL,
+                'pattern', 'UNION_TO_UNION_ALL',
+                'original_sql', v_orig,
+                'rewritten_sql', sta._format_sql(v_new),
+                'finding', 'UNION_TO_UNION_ALL',
+                'finding_text', 'The statement joins two branches with UNION, so PostgreSQL has to sort or '
+                    'hash both branches and remove the duplicates.  UNION ALL skips that work.  The two are '
+                    'only equivalent when the branches cannot produce the same row, for example when they '
+                    'filter on different values of the same column.',
+                'evidence', jsonb_build_object(
+                    'union_count', v_n_union,
+                    'union_all_count', v_n_all,
+                    'plan_nodes', v_nodes),
+                'recommendation', 'Use UNION ALL when the branches cannot produce the same row; when they '
+                    'can, use SELECT DISTINCT * FROM ( ... ) instead.',
+                'expected_benefit', 'The duplicate removal disappears, and so does the sort or hash of the '
+                    'combined result.',
+                'estimated_cost', 'The result can contain duplicates when the branches overlap.',
+                'validation_steps', to_jsonb(sta.validation_steps('rewrite'))));
+        END IF;
+    END IF;
+
+    ------------------------------------------------------------------
+    -- 9. LIMIT n OFFSET m  ->  keyset pagination
+    ------------------------------------------------------------------
+    SELECT m[1]::integer, m[2]::integer
+      INTO v_limit, v_offset
+      FROM regexp_matches(v_sql, '\ylimit\s+([0-9]+)\s+offset\s+([0-9]+)', 'gi') AS m
+     LIMIT 1;
+
+    IF v_limit IS NULL THEN
+        SELECT m[1]::integer, m[2]::integer
+          INTO v_limit, v_offset
+          FROM regexp_matches(v_sql, '\yoffset\s+([0-9]+)\s+limit\s+([0-9]+)', 'gi') AS m
+         LIMIT 1;
+    END IF;
+
+    IF v_limit IS NOT NULL AND v_offset > 0 THEN
+        SELECT m[1], m[2] INTO v_key, v_key_dir
+          FROM regexp_matches(v_sql, '\yorder\s+by\s+([A-Za-z_][A-Za-z0-9_$]*)(?:\s+(asc|desc))?', 'gi') AS m
+         LIMIT 1;
+
+        IF v_key IS NOT NULL AND v_rel IS NOT NULL THEN
+            v_qual := COALESCE(v_alias, sta._sql_relname(v_rel));
+            IF v_qual IS NULL OR v_qual = '' THEN
+                v_outer_ref := v_key;
+            ELSE
+                v_outer_ref := v_qual || '.' || v_key;
+            END IF;
+
+            -- The keyset condition asks for the rows after the last row of
+            -- the previous page.  The caller supplies that value as the
+            -- first parameter, so the server never has to produce and
+            -- discard the rows that come before it.
+            IF lower(COALESCE(v_key_dir, 'asc')) = 'desc' THEN
+                v_cond := format('%s < $1', v_outer_ref);
+            ELSE
+                v_cond := format('%s > $1', v_outer_ref);
+            END IF;
+
+            -- The condition goes in front of the first of GROUP BY, ORDER BY and LIMIT.
+            -- The search looks for the clause and the whitespace in front of
+            -- it, so that it also finds the clause when the statement is
+            -- already laid out on several lines.
+            v_cut := length(v_sql) + 1;
+            FOREACH v_pos IN ARRAY ARRAY[
+                coalesce(regexp_instr(lower(v_sql), '\s+group\s+by\y'), 0),
+                coalesce(regexp_instr(lower(v_sql), '\s+order\s+by\y'), 0),
+                coalesce(regexp_instr(lower(v_sql), '\s+limit\y'), 0)] LOOP
+                IF v_pos > 0 AND v_pos < v_cut THEN
+                    v_cut := v_pos;
+                END IF;
+            END LOOP;
+
+            v_where := coalesce(regexp_instr(lower(v_sql), '\s+where\y'), 0);
+            IF v_where > 0 AND v_where < v_cut THEN
+                v_new := left(v_sql, v_cut - 1) || ' AND ' || v_cond
+                         || substring(v_sql FROM v_cut);
+            ELSE
+                v_new := left(v_sql, v_cut - 1) || ' WHERE ' || v_cond
+                         || substring(v_sql FROM v_cut);
+            END IF;
+
+            -- The OFFSET is replaced by the keyset condition.
+            v_new := regexp_replace(v_new, '\s+offset\s+[0-9]+', '', 'i');
+
+            IF v_new IS DISTINCT FROM v_sql THEN
+                v_findings := v_findings || jsonb_build_array(jsonb_build_object(
+                    'category', 'rewrite',
+                    'severity', 'MEDIUM',
+                    'confidence', 'MEDIUM',
+                    'impact_score', 40,
+                    'object_name', v_rel,
+                    'pattern', 'OFFSET_PAGINATION',
+                    'original_sql', v_orig,
+                    'rewritten_sql', sta._format_sql(v_new),
+                    'finding', 'OFFSET_PAGINATION',
+                    'finding_text', format(
+                        'The statement skips %s rows with OFFSET.  The server has to produce and discard '
+                        'those rows on every page, so the cost of a page grows with its depth.  Keyset '
+                        'pagination asks for the rows after the last one of the previous page instead: the '
+                        'rewrite replaces the OFFSET with a comparison on %s, and the caller passes the '
+                        'sort key of the last row of the previous page as the first parameter.  The rewrite '
+                        'assumes that %s sorts the rows in a stable order; if %s is not unique, a row can '
+                        'be repeated or skipped at the boundary, and a unique sort key is the safe choice.',
+                        v_offset, v_key, v_rel, v_key),
+                    'evidence', jsonb_build_object(
+                        'limit', v_limit,
+                        'offset', v_offset,
+                        'order_by_column', v_key,
+                        'order_by_direction', COALESCE(v_key_dir, 'asc'),
+                        'relation', v_rel,
+                        'plan_nodes', v_nodes),
+                    'recommendation', format(
+                        'Page with a keyset condition on %s, and pass the last value of %s from the '
+                        'previous page as the first parameter.', v_key, v_key),
+                    'expected_benefit', 'The cost of a page no longer grows with the depth of the page.',
+                    'estimated_cost', 'The caller has to keep the sort key of the last row of the page.',
+                    'validation_steps', to_jsonb(sta.validation_steps('rewrite'))));
+            END IF;
+        END IF;
+    END IF;
+
+    ------------------------------------------------------------------
+    -- The findings
+    ------------------------------------------------------------------
+    RETURN QUERY
+    SELECT (f.n)::integer,
+           f.f->>'category',
+           f.f->>'severity',
+           f.f->>'confidence',
+           (f.f->>'impact_score')::integer,
+           f.f->>'object_name',
+           f.f->>'pattern',
+           f.f->>'original_sql',
+           f.f->>'rewritten_sql',
+           f.f->>'finding',
+           f.f->>'finding_text',
+           f.f->'evidence',
+           f.f->>'recommendation',
+           f.f->>'expected_benefit',
+           f.f->>'estimated_cost',
+           ARRAY(SELECT jsonb_array_elements_text(f.f->'validation_steps'))
+      FROM jsonb_array_elements(v_findings) WITH ORDINALITY AS f(f, n);
+END
+$$;
+
+COMMENT ON FUNCTION sta.rewrite_advice(text) IS
+  'Rewrite candidates for a statement: the original text, the rewritten text, and what the rewrite '
+  'assumes, gains and costs.';
+
+------------------------------------------------------------------------------
+-- The rewritten statement, with every rule applied
+--
+-- The rules of sta.rewrite_advice() are independent: each one of them
+-- produces a candidate on its own.  A statement that breaks more than one
+-- rule needs more than one fix, but the caller wants one statement, so
+-- this function applies the rules one after the other, always on the
+-- result of the previous one, and returns the final statement.
+--
+-- The order of the rules matters.  A cast or a date function is fixed
+-- first, because the other rules match on the text of the predicate.
+-- OR and NOT IN are fixed next, then the set operation and the
+-- pagination.  The expansion of "SELECT *" comes last, because it changes
+-- the shape of the statement and would make the other rules miss.
+------------------------------------------------------------------------------
+CREATE FUNCTION sta.rewrite_statement(p_sql text)
+RETURNS TABLE (
+    original_sql  text,
+    rewritten_sql text,
+    applied       text[],
+    changed       boolean
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_cur     text;
+    v_next    text;
+    v_pattern text;
+    v_applied text[] := ARRAY[]::text[];
+    v_seen    text[] := ARRAY[]::text[];
+    v_orig    text;
+    v_round   integer := 0;
+BEGIN
+    IF p_sql IS NULL OR btrim(p_sql) = '' THEN
+        RETURN;
+    END IF;
+
+    v_orig := sta._format_sql(sta._raw_statement(p_sql));
+    v_cur  := v_orig;
+
+    LOOP
+        v_round := v_round + 1;
+        EXIT WHEN v_round > 12;   -- a rule that cannot settle down
+
+        -- The rule that comes first in the order and that has not been
+        -- applied yet.  A rewrite that lands on a statement that was seen
+        -- before is skipped, so that a rule is applied once.
+        SELECT rw.rewritten_sql, rw.pattern
+          INTO v_next, v_pattern
+          FROM sta.rewrite_advice(v_cur) rw
+         WHERE rw.rewritten_sql IS DISTINCT FROM rw.original_sql
+           AND rw.original_sql = v_cur          -- the rule saw this statement
+           AND NOT (rw.rewritten_sql = ANY (v_seen))
+         ORDER BY CASE rw.pattern
+                    WHEN 'IMPLICIT_CAST'            THEN 1
+                    WHEN 'NON_SARGABLE_PREDICATE'   THEN 2
+                    WHEN 'OR_TO_IN'                 THEN 3
+                    WHEN 'NOT_IN_TO_NOT_EXISTS'     THEN 4
+                    WHEN 'UNION_TO_UNION_ALL'       THEN 5
+                    WHEN 'OFFSET_PAGINATION'        THEN 6
+                    WHEN 'LEADING_WILDCARD_LIKE'    THEN 7
+                    WHEN 'SELECT_STAR'              THEN 8
+                    ELSE 9
+                  END,
+                  rw.finding_id
+         LIMIT 1;
+
+        EXIT WHEN NOT FOUND;
+
+        v_seen := array_append(v_seen, v_next);
+        v_cur  := v_next;
+
+        IF NOT (v_pattern = ANY (v_applied)) THEN
+            v_applied := array_append(v_applied, v_pattern);
+        END IF;
+    END LOOP;
+
+    original_sql  := v_orig;
+    rewritten_sql := v_cur;
+    applied       := v_applied;
+    changed       := v_cur IS DISTINCT FROM v_orig;
+    RETURN NEXT;
+END
+$$;
+
+COMMENT ON FUNCTION sta.rewrite_statement(text) IS
+  'The statement as it should be run: every rewrite rule is applied, one after the other, '
+  'and the final statement is returned together with the rules that were used.';
 
 ------------------------------------------------------------------------------
 -- Validation of a proposed change
@@ -1937,7 +3604,7 @@ BEGIN
     IF p_index_ddl !~* '^\s*CREATE\s+(UNIQUE\s+)?INDEX([[:space:]]|$)' THEN
         RAISE EXCEPTION 'sta.validate: p_index_ddl must be a CREATE [UNIQUE] INDEX statement';
     END IF;
-    IF p_index_ddl ~* '\bCONCURRENTLY\b' THEN
+    IF p_index_ddl ~* '\yCONCURRENTLY\y' THEN
         RAISE EXCEPTION 'sta.validate: CREATE INDEX CONCURRENTLY cannot be used here because it cannot run inside a transaction block. Remove CONCURRENTLY; sta.validate always rolls the index back.';
     END IF;
     IF p_index_ddl ~ ';' AND p_index_ddl !~ ';\s*$' THEN
@@ -2081,14 +3748,67 @@ RETURNS TABLE (
 LANGUAGE sql
 STABLE
 AS $$
-    WITH w AS (
-        SELECT * FROM sta.workload_advice(p_window, 0, 0, p_limit)
+    WITH lim AS (
+        SELECT LEAST(GREATEST(p_limit, 1), sta._max_findings()) AS n
     ),
-    p AS (
-        SELECT * FROM sta.plan_advice(p_sql, p_analyze, p_limit) WHERE p_sql IS NOT NULL
+    w AS (
+        SELECT * FROM sta.workload_advice(p_window, 0, 0, p_limit)
     ),
     s AS (
         SELECT * FROM sta.stats_advice(NULL, p_limit)
+    ),
+    /*
+     * The statements that the plan, rewrite and index advisors run against.
+     *
+     * With p_sql only that one statement is analysed.  Without p_sql the
+     * most expensive statements of the workload window are analysed, so a
+     * plain `SELECT * FROM sta.recommendations()` still produces index and
+     * rewrite advice for the workload that was actually observed instead of
+     * only reporting workload counters and table statistics.
+     */
+    targets AS (
+        SELECT p_sql::text AS sql, NULL::bigint AS queryid
+        WHERE p_sql IS NOT NULL
+        UNION ALL
+        SELECT t.sql, t.queryid
+        FROM sta._workload_targets(p_window, LEAST((SELECT n FROM lim), 25)) t
+        WHERE p_sql IS NULL
+    ),
+    p AS (
+        SELECT pa.category, pa.severity, pa.confidence, pa.impact_score,
+               pa.object_name, t.queryid, t.sql::text AS query, pa.finding, pa.finding_text,
+               pa.evidence, pa.recommendation, pa.expected_benefit, pa.estimated_cost,
+               pa.validation_steps
+        FROM targets t
+        CROSS JOIN LATERAL sta.plan_advice(t.sql, p_analyze, 20) pa
+    ),
+    r AS (
+        SELECT rw.category, rw.severity, rw.confidence, rw.impact_score,
+               rw.object_name, t.queryid, rw.original_sql::text AS query, rw.finding, rw.finding_text,
+               rw.evidence, rw.recommendation, rw.expected_benefit, rw.estimated_cost,
+               rw.validation_steps
+        FROM targets t
+        CROSS JOIN LATERAL sta.rewrite_advice(t.sql) rw
+    ),
+    ix AS (
+        SELECT 'index'::text AS category,
+               'HIGH'::text AS severity,
+               ia.confidence::text AS confidence,
+               75::integer AS impact_score,
+               ia.relation::text AS object_name,
+               t.queryid,
+               t.sql::text AS query,
+               'MISSING_INDEX'::text AS finding,
+               ia.rationale::text AS finding_text,
+               jsonb_build_object('relation', ia.relation,
+                                  'columns', to_jsonb(ia.columns),
+                                  'suggested_ddl', ia.suggested_ddl) AS evidence,
+               ia.suggested_ddl::text AS recommendation,
+               ia.estimated_benefit::text AS expected_benefit,
+               ia.estimated_cost::text AS estimated_cost,
+               ia.validation_steps
+        FROM targets t
+        CROSS JOIN LATERAL sta.index_advice(t.sql) ia
     ),
     all_findings AS (
         SELECT w.category, w.severity, w.confidence, w.impact_score,
@@ -2097,7 +3817,7 @@ AS $$
         FROM w
         UNION ALL
         SELECT pl.category, pl.severity, pl.confidence, pl.impact_score,
-               pl.object_name, NULL::bigint, NULL::text, pl.finding, pl.finding_text, pl.evidence,
+               pl.object_name, pl.queryid, pl.query, pl.finding, pl.finding_text, pl.evidence,
                pl.recommendation, pl.expected_benefit, pl.estimated_cost, pl.validation_steps
         FROM p pl
         UNION ALL
@@ -2105,6 +3825,16 @@ AS $$
                st.object_name, NULL::bigint, NULL::text, st.finding, st.finding_text, st.evidence,
                st.recommendation, st.expected_benefit, st.estimated_cost, st.validation_steps
         FROM s st
+        UNION ALL
+        SELECT rw.category, rw.severity, rw.confidence, rw.impact_score,
+               rw.object_name, rw.queryid, rw.query, rw.finding, rw.finding_text, rw.evidence,
+               rw.recommendation, rw.expected_benefit, rw.estimated_cost, rw.validation_steps
+        FROM r rw
+        UNION ALL
+        SELECT i.category, i.severity, i.confidence, i.impact_score,
+               i.object_name, i.queryid, i.query, i.finding, i.finding_text, i.evidence,
+               i.recommendation, i.expected_benefit, i.estimated_cost, i.validation_steps
+        FROM ix i
     )
     SELECT (ROW_NUMBER() OVER (ORDER BY f.impact_score DESC,
                                CASE f.severity
@@ -2133,7 +3863,466 @@ AS $$
 $$;
 
 COMMENT ON FUNCTION sta.recommendations(text, text, boolean, integer) IS
-  'All findings from the workload, plan and statistics advisors, ranked by impact.';
+  'All findings from the workload, plan, statistics and rewrite advisors, ranked by impact.';
+
+------------------------------------------------------------------------------
+-- Action plan
+--
+-- The other advisors say what is wrong.  The action plan says what to do
+-- about it: it turns every finding into a statement that can be run as it
+-- is, together with the reason, the benefit, the cost and the risk.
+--
+-- The order is not arbitrary.  The statistics come first, because a
+-- correct estimate can remove the need for an index.  The index comes
+-- next.  The rewritten statement comes last, because it has to be written
+-- against the statement that the application really runs.
+------------------------------------------------------------------------------
+CREATE FUNCTION sta.action_plan(
+    p_sql     text    DEFAULT NULL,
+    p_window  text    DEFAULT 'window',
+    p_analyze boolean DEFAULT false,
+    p_limit   integer DEFAULT 50
+)
+RETURNS TABLE (
+    action_id        integer,
+    action_type      text,
+    priority         integer,
+    object_name      text,
+    queryid          bigint,
+    query            text,
+    action_sql       text,
+    finding          text,
+    finding_text     text,
+    severity         text,
+    confidence       text,
+    rationale        text,
+    expected_benefit text,
+    estimated_cost   text,
+    risk             text,
+    validation_steps text[]
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_actions jsonb := '[]'::jsonb;
+    r         record;
+    t         record;
+    v_type    text;
+    v_sql     text;
+    v_prio    integer;
+    v_risk    text;
+    v_seen_ddl text[] := ARRAY[]::text[];
+    v_ddl_text text;
+    v_seen_analyze text[] := ARRAY[]::text[];
+    v_seen_vacuum text[] := ARRAY[]::text[];
+    v_orig_sql  text;
+    v_new_sql   text;
+    v_applied   text[];
+    v_finding_text text;
+    v_rationale text;
+    v_benefit   text;
+    v_cost      text;
+    v_object_name text;
+    v_steps     text[];
+    v_severity  text;
+    v_confidence text;
+BEGIN
+    ------------------------------------------------------------------
+    -- 1. Statistics
+    ------------------------------------------------------------------
+    FOR r IN SELECT s.* FROM sta.stats_advice(NULL, p_limit) s
+    LOOP
+        IF r.finding IN ('NEVER_ANALYZED', 'STALE_STATISTICS') THEN
+            CONTINUE WHEN r.object_name = ANY (v_seen_analyze);
+            v_seen_analyze := array_append(v_seen_analyze, r.object_name);
+            v_type := 'ANALYZE';
+            v_prio := 10;
+            v_sql  := format('ANALYZE %s;', r.object_name);
+            v_risk := 'None. ANALYZE only reads the relation and writes the '
+                      'statistics.  It takes a SHARE UPDATE EXCLUSIVE lock, so it '
+                      'does not block reads or writes.';
+        ELSIF r.finding IN ('HIGH_DEAD_TUPLES', 'NEVER_VACUUMED') THEN
+            -- A relation with dead tuples and a relation that was never
+            -- vacuumed need the same command, so the action is only
+            -- emitted once for each relation.
+            CONTINUE WHEN r.object_name = ANY (v_seen_vacuum);
+            v_seen_vacuum := array_append(v_seen_vacuum, r.object_name);
+            v_type := 'VACUUM_ANALYZE';
+            v_prio := 5;
+            v_sql  := format('VACUUM (ANALYZE) %s;', r.object_name);
+            v_risk := 'Low. VACUUM takes a SHARE UPDATE EXCLUSIVE lock and adds '
+                      'I/O load to the server.  A VACUUM FULL would lock the '
+                      'relation while it rewrites it and is not needed here.';
+        ELSE
+            CONTINUE;
+        END IF;
+
+        v_actions := v_actions || jsonb_build_array(jsonb_build_object(
+            'action_type',      v_type,
+            'priority',         v_prio,
+            'object_name',      r.object_name,
+            'queryid',          NULL::bigint,
+            'query',            NULL::text,
+            'action_sql',       v_sql,
+            'finding',          r.finding,
+            'finding_text',     r.finding_text,
+            'severity',         r.severity,
+            'confidence',       r.confidence,
+            'rationale',        r.recommendation,
+            'expected_benefit', r.expected_benefit,
+            'estimated_cost',   r.estimated_cost,
+            'risk',             v_risk,
+            'validation_steps', to_jsonb(r.validation_steps)));
+    END LOOP;
+
+    ------------------------------------------------------------------
+    -- 2. The statements to work on
+    ------------------------------------------------------------------
+    FOR t IN
+        SELECT p_sql::text AS sql, NULL::bigint AS queryid
+        WHERE p_sql IS NOT NULL
+        UNION ALL
+        SELECT x.sql, x.queryid
+        FROM sta._workload_targets(p_window, LEAST(GREATEST(p_limit, 1), 25)) x
+        WHERE p_sql IS NULL
+    LOOP
+        -- 2a. The index candidates.
+        BEGIN
+            FOR r IN SELECT ia.* FROM sta.index_advice(t.sql) ia
+            LOOP
+                -- The same index is asked for by more than one statement of
+                -- the workload.  It is only built once.
+                CONTINUE WHEN r.suggested_ddl = ANY (v_seen_ddl);
+                v_seen_ddl := array_append(v_seen_ddl, r.suggested_ddl);
+                v_actions := v_actions || jsonb_build_array(jsonb_build_object(
+                    'action_type',      'CREATE_INDEX',
+                    'priority',         20,
+                    'object_name',      r.relation,
+                    'queryid',          t.queryid,
+                    'query',            t.sql,
+                    'action_sql',       r.suggested_ddl,
+                    'finding',          'MISSING_INDEX',
+                    'finding_text',     r.rationale,
+                    'severity',         'HIGH',
+                    'confidence',       r.confidence,
+                    'rationale',        r.rationale,
+                    'expected_benefit', r.estimated_benefit,
+                    'estimated_cost',   r.estimated_cost,
+                    'risk',             'Medium. CREATE INDEX CONCURRENTLY reads '
+                                        'the relation twice and cannot run inside a '
+                                        'transaction block.  A build that fails '
+                                        'leaves an invalid index behind that has to '
+                                        'be dropped before the name can be used '
+                                        'again.',
+                    'validation_steps', to_jsonb(r.validation_steps)));
+            END LOOP;
+        EXCEPTION WHEN others THEN
+            NULL;   -- a statement that cannot be planned has no index advice
+        END;
+
+        -- 2b. The rewritten statements.
+        BEGIN
+            FOR r IN SELECT rw.* FROM sta.rewrite_advice(t.sql) rw
+            LOOP
+                -- A rewrite that has no safe rewrite but carries the DDL of
+                -- the index that would serve it becomes an index action.
+                IF r.evidence ? 'suggested_ddl'
+                   AND r.evidence->>'suggested_ddl' IS NOT NULL
+                   AND NOT (r.evidence->>'suggested_ddl' = ANY (v_seen_ddl)) THEN
+                    v_seen_ddl := array_append(v_seen_ddl, r.evidence->>'suggested_ddl');
+                    v_ddl_text := r.evidence->>'suggested_ddl';
+                    -- A trigram index needs pg_trgm.  The action has to be
+                    -- runnable, so the extension is installed first when it
+                    -- is missing.
+                    IF r.pattern = 'LEADING_WILDCARD_LIKE'
+                       AND v_ddl_text LIKE '%gin_trgm_ops%'
+                       AND NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') THEN
+                        v_ddl_text := 'CREATE EXTENSION IF NOT EXISTS pg_trgm;'
+                                   || E'\n' || v_ddl_text;
+                    END IF;
+                    v_actions := v_actions || jsonb_build_array(jsonb_build_object(
+                        'action_type',      'CREATE_INDEX',
+                        'priority',         20,
+                        'object_name',      r.object_name,
+                        'queryid',          t.queryid,
+                        'query',            r.original_sql,
+                        'action_sql',       v_ddl_text,
+                        'finding',          r.pattern,
+                        'finding_text',     r.finding_text,
+                        'severity',         r.severity,
+                        'confidence',       r.confidence,
+                        'rationale',        r.recommendation,
+                        'expected_benefit', r.expected_benefit,
+                        'estimated_cost',   r.estimated_cost,
+                        'risk',             'Medium. CREATE INDEX CONCURRENTLY reads '
+                                            'the relation twice and cannot run inside a '
+                                            'transaction block.  A build that fails '
+                                            'leaves an invalid index behind that has to '
+                                            'be dropped before the name can be used '
+                                            'again.',
+                        'validation_steps', to_jsonb(r.validation_steps)));
+                END IF;
+
+            END LOOP;
+
+            -- One rewritten statement per statement.  Every rule is
+            -- applied, one after the other, so that the statement that
+            -- comes out can be run as it is.
+            SELECT rs.original_sql, rs.rewritten_sql, rs.applied
+              INTO v_orig_sql, v_new_sql, v_applied
+              FROM sta.rewrite_statement(t.sql) rs;
+
+            IF v_new_sql IS NOT NULL AND v_new_sql IS DISTINCT FROM v_orig_sql THEN
+                -- What the rules that were used have to say.
+                SELECT coalesce(string_agg(DISTINCT rw.finding_text, ' '), ''),
+                       coalesce(string_agg(DISTINCT rw.recommendation, ' '), ''),
+                       coalesce(string_agg(DISTINCT rw.expected_benefit, ' '), ''),
+                       coalesce(string_agg(DISTINCT rw.estimated_cost, ' '), '')
+                  INTO v_finding_text, v_rationale, v_benefit, v_cost
+                  FROM sta.rewrite_advice(t.sql) rw
+                 WHERE rw.pattern = ANY (v_applied);
+
+                -- The severity and the confidence of the most important of
+                -- the rules that were used.
+                SELECT rw.severity, rw.confidence, rw.object_name, rw.validation_steps
+                  INTO v_severity, v_confidence, v_object_name, v_steps
+                  FROM sta.rewrite_advice(t.sql) rw
+                 WHERE rw.pattern = ANY (v_applied)
+                 ORDER BY CASE rw.severity
+                              WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2
+                              WHEN 'LOW' THEN 1 ELSE 0 END DESC,
+                          CASE rw.confidence
+                              WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2
+                              WHEN 'LOW' THEN 1 ELSE 0 END DESC
+                 LIMIT 1;
+
+                v_actions := v_actions || jsonb_build_array(jsonb_build_object(
+                    'action_type',      'REWRITE',
+                    'priority',         30,
+                    'object_name',      v_object_name,
+                    'queryid',          t.queryid,
+                    'query',            v_orig_sql,
+                    'action_sql',       v_new_sql,
+                    'finding',          array_to_string(v_applied, ', '),
+                    'finding_text',     v_finding_text,
+                    'severity',         coalesce(v_severity, 'MEDIUM'),
+                    'confidence',       coalesce(v_confidence, 'MEDIUM'),
+                    'rationale',        v_rationale,
+                    'expected_benefit', v_benefit,
+                    'estimated_cost',   v_cost,
+                    'risk',             'Depends on the rules that were used.  The '
+                                        'findings list the assumption every rewrite '
+                                        'depends on; check them before the rewritten '
+                                        'statement is used.',
+                    'validation_steps', to_jsonb(coalesce(v_steps, ARRAY[]::text[]))));
+            END IF;
+        EXCEPTION WHEN others THEN
+            NULL;   -- a statement that cannot be parsed has no rewrite advice
+        END;
+
+        -- 2c. The statistics that a measured plan asks for.  The plan is
+        -- only measured when the caller asks for it, because measuring a
+        -- statement runs it.
+        IF p_analyze THEN
+            BEGIN
+                FOR r IN SELECT pa.* FROM sta.plan_advice(t.sql, true, 50) pa
+                LOOP
+                    CONTINUE WHEN r.finding <> 'ESTIMATE_MISMATCH';
+                    CONTINUE WHEN r.object_name IS NULL;
+                    CONTINUE WHEN r.object_name = ANY (v_seen_analyze);
+                    v_seen_analyze := array_append(v_seen_analyze, r.object_name);
+                    v_actions := v_actions || jsonb_build_array(jsonb_build_object(
+                        'action_type',      'ANALYZE',
+                        'priority',         10,
+                        'object_name',      r.object_name,
+                        'queryid',          t.queryid,
+                        'query',            t.sql,
+                        'action_sql',       format('ANALYZE %s;', r.object_name),
+                        'finding',          r.finding,
+                        'finding_text',     r.finding_text,
+                        'severity',         r.severity,
+                        'confidence',       r.confidence,
+                        'rationale',        r.recommendation,
+                        'expected_benefit', r.expected_benefit,
+                        'estimated_cost',   r.estimated_cost,
+                        'risk',             'None. ANALYZE only reads the relation and '
+                                            'writes the statistics.  It takes a SHARE '
+                                            'UPDATE EXCLUSIVE lock, so it does not '
+                                            'block reads or writes.',
+                        'validation_steps', to_jsonb(r.validation_steps)));
+                END LOOP;
+            EXCEPTION WHEN others THEN
+                NULL;   -- a statement that cannot be measured has no plan advice
+            END;
+        END IF;
+    END LOOP;
+
+    RETURN QUERY
+    SELECT x.n::integer,
+           x.action->>'action_type',
+           (x.action->>'priority')::integer,
+           x.action->>'object_name',
+           (x.action->>'queryid')::bigint,
+           x.action->>'query',
+           x.action->>'action_sql',
+           x.action->>'finding',
+           x.action->>'finding_text',
+           x.action->>'severity',
+           x.action->>'confidence',
+           x.action->>'rationale',
+           x.action->>'expected_benefit',
+           x.action->>'estimated_cost',
+           x.action->>'risk',
+           ARRAY(SELECT jsonb_array_elements_text(x.action->'validation_steps'))
+      FROM (SELECT j.n,
+                   j.j AS action,
+                   row_number() OVER (ORDER BY (j.j->>'priority')::integer, j.n) AS rn
+              FROM jsonb_array_elements(v_actions) WITH ORDINALITY AS j(j, n)) x
+     WHERE x.rn <= LEAST(GREATEST(p_limit, 1), 200)
+        -- When one statement is asked for, the actions that belong to that
+        -- statement are always returned, even when the limit is reached.
+        -- The caller asked for this statement and not for the workload, so
+        -- the advice about the statement must not be dropped in favour of
+        -- the advice about other relations.
+        OR (p_sql IS NOT NULL
+            AND x.action->>'action_type' IN ('REWRITE', 'CREATE_INDEX'))
+     ORDER BY (x.action->>'priority')::integer, x.n;
+END
+$$;
+
+COMMENT ON FUNCTION sta.action_plan(text, text, boolean, integer) IS
+  'The changes that the findings ask for, as runnable statements, ordered by priority.';
+
+/*
+ * The action plan as one script.
+ *
+ * The script is meant to be read before it is run: every step states why
+ * it is there, what it is expected to gain, what it costs and how to
+ * check that it worked.
+ */
+CREATE FUNCTION sta.action_script(
+    p_sql     text    DEFAULT NULL,
+    p_window  text    DEFAULT 'window',
+    p_analyze boolean DEFAULT false,
+    p_limit   integer DEFAULT 50
+)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    r     record;
+    v_out text;
+    v_n   integer := 0;
+    v_step text;
+    v_val text;
+BEGIN
+    v_out := format(
+        E'-- ===========================================================================\n'
+     || E'-- pg_sta action script\n'
+     || E'-- Generated at %s on database %s\n'
+     || E'-- Scope: %s\n'
+     || E'--\n'
+     || E'-- Read the whole script before you run it.  The order matters: the\n'
+     || E'-- statistics come first, because a correct estimate can remove the need\n'
+     || E'-- for an index, and the rewritten statements come last, because they\n'
+     || E'-- have to be written against the statement the application really runs.\n'
+     || E'-- ===========================================================================\n\n',
+        now(),
+        current_database(),
+        CASE WHEN p_sql IS NULL
+             THEN format('the %s of the workload', p_window)
+             ELSE 'a single statement'
+        END);
+
+    FOR r IN
+        SELECT * FROM sta.action_plan(p_sql, p_window, p_analyze, p_limit)
+        ORDER BY priority, action_id
+    LOOP
+        v_n := v_n + 1;
+        v_step := format(
+            E'-- ---------------------------------------------------------------------------\n'
+         || E'-- %s. [%s] %s\n'
+         || E'--\n'
+         || E'-- Why:     %s\n'
+         || E'-- Benefit: %s\n'
+         || E'-- Cost:    %s\n'
+         || E'-- Risk:    %s\n',
+            v_n,
+            r.action_type,
+            coalesce(r.object_name, r.finding),
+            coalesce(r.finding_text, r.rationale),
+            coalesce(r.expected_benefit, 'not stated'),
+            coalesce(r.estimated_cost, 'not stated'),
+            coalesce(r.risk, 'not stated'));
+
+        IF r.action_type = 'REWRITE' THEN
+            v_step := v_step
+                   || format(E'--\n-- Original statement:\n--   %s\n',
+                             replace(coalesce(r.query, ''), E'\n', E'\n--   '));
+        ELSE
+            v_step := v_step
+                   || format(E'--\n-- Command:\n--   %s\n',
+                             replace(coalesce(r.action_sql, ''), E'\n', E'\n--   '));
+        END IF;
+
+        v_out := v_out || v_step;
+
+        -- The validation steps.
+        IF array_length(r.validation_steps, 1) > 0 THEN
+            v_out := v_out || E'--\n';
+            FOREACH v_val IN ARRAY r.validation_steps LOOP
+                v_out := v_out || format(E'--   - %s\n', v_val);
+            END LOOP;
+        END IF;
+
+        v_out := v_out || E'--\n';
+
+        -- The statement itself.
+        IF r.action_type = 'REWRITE' THEN
+            v_out := v_out
+                  || format(E'-- Rewritten statement (%s):\n',
+                            coalesce(r.finding, 'REWRITE'));
+            IF coalesce(r.action_sql, '') ~ '\$\d+' THEN
+                -- The statement uses a parameter placeholder, so it cannot
+                -- be run as it is.  It is shown as a comment, with the
+                -- instruction that says what the parameter means.
+                v_out := v_out
+                      || format(E'-- This statement uses a parameter placeholder, so it is shown\n'
+                             || E'-- as a comment.  Replace the placeholder with the value the\n'
+                             || E'-- application has to pass and run the statement yourself.\n'
+                             || E'--\n-- %s\n\n',
+                               replace(coalesce(r.action_sql, ''), E'\n', E'\n-- '));
+            ELSE
+                v_out := v_out
+                      || format(E'%s;\n\n',
+                                rtrim(coalesce(r.action_sql, ''), '; '));
+            END IF;
+        ELSE
+            v_out := v_out || format(E'%s\n\n', coalesce(r.action_sql, ''));
+            IF r.action_type = 'CREATE_INDEX' THEN
+                v_out := v_out
+                      || E'-- Note: CREATE INDEX CONCURRENTLY cannot run inside a transaction\n'
+                      || E'-- block, so run it on its own.\n\n';
+            END IF;
+        END IF;
+    END LOOP;
+
+    IF v_n = 0 THEN
+        v_out := v_out
+              || E'-- No action was found.  That is not always a problem: the advisor\n'
+              || E'-- can only act on what it has seen.  Collect a snapshot of the\n'
+              || E'-- workload first (sta.collect()), run the statements again, and\n'
+              || E'-- ask a second time.\n';
+    END IF;
+
+    RETURN v_out;
+END
+$$;
+
+COMMENT ON FUNCTION sta.action_script(text, text, boolean, integer) IS
+  'The action plan as one commented script that can be reviewed and then run.';
 
 ------------------------------------------------------------------------------
 -- Everything that is known about a single statement
@@ -2182,6 +4371,12 @@ BEGIN
         FROM sta.stats_advice(NULL, 1000) st
         JOIN plan_rels pr ON pr.schema || '.' || pr.relname = st.object_name
     ),
+    rewrite_rows AS (
+        SELECT * FROM sta.rewrite_advice(v_text)
+    ),
+    index_rows AS (
+        SELECT * FROM sta.index_advice(v_text)
+    ),
     all_rows AS (
         SELECT p.category, p.severity, p.confidence, p.impact_score, p.object_name,
                p.finding, p.finding_text, p.evidence, p.recommendation, p.expected_benefit,
@@ -2197,6 +4392,19 @@ BEGIN
                s.finding, s.finding_text, s.evidence, s.recommendation, s.expected_benefit,
                s.estimated_cost, s.validation_steps
         FROM stats_rows s
+        UNION ALL
+        SELECT rw.category, rw.severity, rw.confidence, rw.impact_score, rw.object_name,
+               rw.finding, rw.finding_text, rw.evidence, rw.recommendation, rw.expected_benefit,
+               rw.estimated_cost, rw.validation_steps
+        FROM rewrite_rows rw
+        UNION ALL
+        SELECT 'index'::text, 'HIGH'::text, i.confidence, 75::integer, i.relation,
+               'MISSING_INDEX'::text, i.rationale,
+               jsonb_build_object('relation', i.relation,
+                                  'columns', to_jsonb(i.columns),
+                                  'suggested_ddl', i.suggested_ddl),
+               i.suggested_ddl, i.estimated_benefit, i.estimated_cost, i.validation_steps
+        FROM index_rows i
     )
     SELECT (ROW_NUMBER() OVER (ORDER BY a.impact_score DESC,
                                CASE a.severity
@@ -2214,7 +4422,7 @@ END
 $$;
 
 COMMENT ON FUNCTION sta.statement_advice(bigint, boolean) IS
-  'All findings that relate to one statement: plan, workload and relation statistics.';
+  'All findings that relate to one statement: plan, workload, relation statistics and rewrites.';
 
 ------------------------------------------------------------------------------
 -- EXPLAIN by canonical query id
@@ -2331,6 +4539,10 @@ AS $$
        'The relation accumulated many dead tuples.',
        'pg_stat_all_tables.n_dead_tup',
        'Run VACUUM (ANALYZE).', 'vacuum'),
+      ('statistics', 'NEVER_VACUUMED', 'LOW',
+       'The relation has dead tuples but has never been vacuumed, so its visibility map is still empty.',
+       'pg_stat_all_tables.last_vacuum / last_autovacuum',
+       'Run VACUUM (ANALYZE).', 'vacuum'),
       ('statistics', 'NO_PRIMARY_KEY', 'LOW',
        'The relation has no primary key.',
        'pg_index.indisprimary',
@@ -2354,7 +4566,39 @@ AS $$
       ('snapshot', 'INDEX_NO_LONGER_USED', 'LOW',
        'The index was used before but has not been used during the last window.',
        'sta.index_sample.idx_scan',
-       'Review the index; drop it only if it stays unused over several windows.', 'index')
+       'Review the index; drop it only if it stays unused over several windows.', 'index'),
+      ('rewrite', 'SELECT_STAR', 'MEDIUM',
+       'The statement reads every column of the relation, including the columns it does not use.',
+       'The text of the statement (SELECT *) and pg_attribute',
+       'Name the columns the statement uses.', 'rewrite'),
+      ('rewrite', 'OR_TO_IN', 'MEDIUM',
+       'The statement tests the same column twice with an OR, which the planner cannot serve with one index lookup.',
+       'The text of the statement (col = a OR col = b)',
+       'Use an IN list on the column.', 'rewrite'),
+      ('rewrite', 'NOT_IN_TO_NOT_EXISTS', 'MEDIUM',
+       'The statement uses NOT IN with a subquery, which is evaluated as a hashed anti-join over the whole subquery.',
+       'The text of the statement (NOT IN (SELECT ...))',
+       'Rewrite the predicate as NOT EXISTS, after checking the NULL semantics.', 'rewrite'),
+      ('rewrite', 'NON_SARGABLE_PREDICATE', 'HIGH',
+       'A function is applied to the filtered column, so an index on that column cannot be used.',
+       'The text of the statement (lower(col) = ... , date(col) = ...)',
+       'Compare the column directly, or index the expression.', 'rewrite'),
+      ('rewrite', 'IMPLICIT_CAST', 'HIGH',
+       'The filtered column is cast to text, so an index on the column cannot be used.',
+       'The text of the statement (col::text = ...)',
+       'Compare the column with a literal of its own type.', 'rewrite'),
+      ('rewrite', 'LEADING_WILDCARD_LIKE', 'HIGH',
+       'The pattern starts with a wildcard, so a B-tree index on the column cannot be used.',
+       'The text of the statement (col LIKE ''%x%'')',
+       'Create a trigram index on the column with pg_trgm.', 'rewrite'),
+      ('rewrite', 'UNION_TO_UNION_ALL', 'LOW',
+       'The statement joins two branches with UNION, so the duplicates have to be removed.',
+       'The text of the statement (UNION without ALL)',
+       'Use UNION ALL when the branches cannot produce the same row.', 'rewrite'),
+      ('rewrite', 'OFFSET_PAGINATION', 'MEDIUM',
+       'The statement skips rows with OFFSET, so the cost of a page grows with its depth.',
+       'The text of the statement (LIMIT n OFFSET m)',
+       'Page with a keyset condition on the sort key.', 'rewrite')
     ) AS t(category, finding, default_severity, description, evidence_source,
            recommended_action, validation_kind)
 $$;

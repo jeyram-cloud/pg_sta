@@ -44,6 +44,32 @@ pg_sta_resolve_mode
 
 AS_PG=$(pg_sta_postgres_prefix)
 
+# -------------------------------------------------------------------------
+# Static analysis of the extension scripts
+#
+# The SQL of the advisory engine is PL/pgSQL, and PL/pgSQL bodies are not
+# parsed when the extension is created.  A wrong number of arguments in a
+# format() call or an unbalanced parenthesis is therefore invisible until
+# the statement is executed for the first time.  The linter models the
+# PostgreSQL lexer and catches those defects before the extension is even
+# installed, so the QA suite can never run against a broken script.
+# -------------------------------------------------------------------------
+echo "==> linting the extension scripts"
+if [ -f "$ROOT/scripts/lint_sql.py" ]; then
+    LINT_OUT=$(python3 "$ROOT/scripts/lint_sql.py" \
+        "$ROOT/sql/pg_sta--0.1.2.sql" \
+        "$ROOT/sql/pg_sta--0.1.1--0.1.2.sql" \
+        "$ROOT/sql/pg_sta--0.1.0--0.1.2.sql" 2>&1)
+    if [ $? -ne 0 ]; then
+        echo "$LINT_OUT"
+        echo "!! the extension scripts do not pass the linter"
+        exit 1
+    fi
+    echo "$LINT_OUT"
+else
+    echo "    (scripts/lint_sql.py not found, skipping)"
+fi
+
 # The QA files are staged in a work directory because the source tree may
 # not be readable by the postgres user.
 WORKDIR=${PG_STA_WORKDIR:-/tmp/pg_sta_qa_run}
@@ -63,13 +89,14 @@ pg_sta_push "$ROOT/test/qa_assertions.sql" "$ASSERT"
 pg_sta_ssh "chmod 644 '$SETUP' '$ASSERT' 2>/dev/null || true"
 
 echo "==> ensuring database '$PG_STA_PGDATABASE' and extension exist"
+# The extension is dropped and created again, so that the QA run always
+# tests the SQL that was just installed and never a stale copy of it.
 pg_sta_ssh "
     set -e
     $AS_PG psql -X -tAc \"SELECT 1 FROM pg_database WHERE datname='$PG_STA_PGDATABASE'\" \
         | grep -q 1 || $AS_PG createdb '$PG_STA_PGDATABASE'
-    $AS_PG psql -X -tAc \"SELECT 1 FROM pg_extension WHERE extname='pg_sta'\" \
-        -d '$PG_STA_PGDATABASE' | grep -q 1 \
-        || $AS_PG psql -X -d '$PG_STA_PGDATABASE' -c 'CREATE EXTENSION pg_sta'
+    $AS_PG psql -X -q -d '$PG_STA_PGDATABASE' -c 'DROP EXTENSION IF EXISTS pg_sta CASCADE'
+    $AS_PG psql -X -q -d '$PG_STA_PGDATABASE' -c 'CREATE EXTENSION pg_sta'
 "
 
 echo "==> running QA setup"

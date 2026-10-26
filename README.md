@@ -42,6 +42,9 @@ cannot be validated is not a recommendation.
 | **Plan** | Sequential scans, estimate/actual mismatch, nested-loop explosions, hash batching, sort spills, bitmap rechecks, temp blocks, high cost |
 | **Statistics** | Never analyzed, stale statistics, dead-tuple bloat, missing primary key, missing indexes |
 | **Index** | Index candidates derived from the filters of real sequential scans, with ready-to-run DDL |
+| **Action plan** | `sta.action_plan()` turns the findings into runnable commands — `CREATE INDEX CONCURRENTLY …`, `ANALYZE`, `VACUUM (ANALYZE)` and the rewritten statement — ordered by priority |
+| **Action script** | `sta.action_script()` returns the whole plan as one commented, runnable file: every step carries its reason, its benefit, its cost and its validation steps |
+| **Rewrites** | `sta.rewrite_statement()` applies every rewrite rule to a statement at once and returns the complete, formatted SQL — `NOT IN` → `NOT EXISTS`, `OR` → `IN`, `col::text` → `col`, `OFFSET` → keyset pagination, `SELECT *` → the real columns |
 | **Validation** | `sta.validate()` measures a candidate index against the current plan in a rolled-back subtransaction and returns a verdict |
 | **Explainability** | Every finding carries structured `evidence` (JSONB), not just prose |
 | **Calibratable** | All 16 decision thresholds live in `sta.threshold` and can be tuned without recompiling |
@@ -87,6 +90,15 @@ sudo -u postgres psql -d appdb -c "
   FROM sta.recommendations()
   ORDER BY impact_score DESC LIMIT 20;"
 
+# 4b. turn the findings into the changes that implement them
+sudo -u postgres psql -d appdb -c "
+  SELECT action_type, priority, object_name, action_sql
+  FROM sta.action_plan() ORDER BY priority, action_id;"
+
+# 4c. get the whole plan as one commented, runnable script
+sudo -u postgres psql -X -tA -d appdb \
+  -c "SELECT sta.action_script(NULL, 'cumulative', false, 100);" > /tmp/pg_sta_actions.sql
+
 # 5. compare two snapshots and record the run
 sudo -u postgres psql -d appdb -c "SELECT * FROM sta.collect();"
 sudo -u postgres psql -d appdb -c "SELECT * FROM sta.snapshot_diff('public');"
@@ -97,6 +109,10 @@ Or from the command line:
 
 ```bash
 ./scripts/pg_sta_ctl --database appdb report
+
+# the change itself, from the command line
+./scripts/pg_sta_ctl --database appdb actions "SELECT * FROM orders WHERE customer_id = 42"
+./scripts/pg_sta_ctl --database appdb script  "SELECT * FROM orders WHERE customer_id = 42" > fix.sql
 ```
 
 No database to try it on? Load the demo fixture — two tables, a captured
@@ -181,6 +197,80 @@ is in **[docs/pg19-compatibility.md](docs/pg19-compatibility.md)**.
 
 ---
 
+## From findings to changes: the action plan and the action script
+
+A finding that does not say what to change is only half an answer. `pg_sta`
+therefore also produces the **change itself**, as a runnable statement:
+
+```sql
+SELECT action_type, priority, object_name, action_sql
+FROM sta.action_plan(NULL, 'cumulative', false, 100);
+```
+
+```
+ action_type   | priority |      object_name      |                 action_sql
+---------------+----------+------------------------+--------------------------------------------------
+ VACUUM_ANALYZE |        5 | public.sta_demo       | VACUUM (ANALYZE) public.sta_demo;
+ ANALYZE        |       10 | public.sta_demo       | ANALYZE public.sta_demo;
+ CREATE_INDEX   |       20 | public.orders         | CREATE INDEX CONCURRENTLY idx_orders_customer_id ON public.orders (customer_id);
+ CREATE_INDEX   |       20 | public.customers      | CREATE EXTENSION IF NOT EXISTS pg_trgm;
+                |          |                        | CREATE INDEX CONCURRENTLY idx_customers_email_trgm ON public.customers USING gin (email gin_trgm_ops);
+ REWRITE        |       30 | orders                | SELECT order_id, customer_id, order_date FROM orders WHERE NOT EXISTS (SELECT 1 FROM customers WHERE …)
+```
+
+`sta.action_script()` returns the whole plan as one file that can be
+reviewed and then run as it is:
+
+```bash
+sudo -u postgres psql -X -tA -d appdb \
+  -c "SELECT sta.action_script(NULL, 'cumulative', false, 100);" > /tmp/pg_sta_actions.sql
+less /tmp/pg_sta_actions.sql
+sudo -u postgres psql -X -v ON_ERROR_STOP=1 -d appdb -f /tmp/pg_sta_actions.sql
+```
+
+Every step of the script states why it is there, what it buys, what it
+costs, how risky it is and how to check that it worked:
+
+```
+-- ---------------------------------------------------------------------------
+-- 11. [REWRITE] orders
+--
+-- Why:     The statement reads every column of orders, including the columns it does not use. …
+--          The statement uses NOT IN with a subquery.  NOT IN is evaluated as a hashed anti-join …
+--
+-- Original statement:
+--   SELECT *
+--   FROM orders
+--   WHERE customer_id NOT IN (SELECT customer_id FROM customers WHERE email LIKE '%@example.com')
+--
+-- Rewritten statement (NOT_IN_TO_NOT_EXISTS, SELECT_STAR):
+SELECT order_id,
+       customer_id,
+       order_date
+FROM orders
+WHERE NOT EXISTS (SELECT 1 FROM customers WHERE email LIKE '%@example.com' AND customers.customer_id = orders.customer_id);
+```
+
+The rewrites come from `sta.rewrite_statement()`, which applies **every**
+rule to a statement and returns the complete, formatted SQL:
+
+```sql
+SELECT original_sql, rewritten_sql, applied, changed
+FROM sta.rewrite_statement(
+    'SELECT * FROM orders WHERE customer_id NOT IN (SELECT customer_id FROM customers)');
+```
+
+The rules are `IMPLICIT_CAST`, `NON_SARGABLE_PREDICATE`, `OR_TO_IN`,
+`NOT_IN_TO_NOT_EXISTS`, `UNION_TO_UNION_ALL`, `LEADING_WILDCARD_LIKE`,
+`SELECT_STAR` and `OFFSET_PAGINATION`. Each one lists the assumption it
+depends on — `NOT IN` returns no rows at all when the subquery produces a
+single `NULL`, `NOT EXISTS` does not — so the rewrite can be judged before
+it is used.
+
+The full guide: [docs/usage.md §6.9–6.11](docs/usage.md#69-the-action-plan--the-change-as-a-runnable-statement).
+
+---
+
 ## Example
 
 ```
@@ -229,9 +319,11 @@ pg_sta: 38 finding(s)
       │
       ▼
   ┌───────────────────────────────────────────────────────────┐
-  │  SQL advisory layer (sql/pg_sta--0.1.0.sql)               │
+  │  SQL advisory layer (sql/pg_sta--0.1.2.sql)               │
   │    workload_advice()  plan_advice()  stats_advice()      │
   │    index_advice()     validate()     recommendations()   │
+  │    action_plan()      action_script()                    │
+  │    rewrite_advice()   rewrite_statement()                │
   │    snapshot_diff()    record_run()                       │
   │                                                          │
   │  PostgreSQL 19 parity layer                              │
@@ -272,8 +364,11 @@ pg_sta/
 ├── pg_sta.control           extension control file
 ├── src/pg_sta.c             C core: queryid, normalisation, EXPLAIN, server info
 ├── sql/
-│   ├── pg_sta--0.1.0.sql    the advisory engine (schema "sta")
+│   ├── pg_sta--0.1.2.sql    the advisory engine (schema "sta")
+│   ├── pg_sta--0.1.0--0.1.2.sql   upgrade path from 0.1.0
+│   ├── pg_sta--0.1.1--0.1.2.sql   upgrade path from 0.1.1
 │   ├── pg_sta.sql           regression test
+│   ├── orders_workload.sql  a 10-statement workload for the demo schema
 │   ├── sample_data.sql      demo schema: orders, customers, workload
 │   └── sample_workload.sql  a captured workload for the demo schema
 ├── expected/pg_sta.out      recorded regression output
@@ -286,10 +381,13 @@ pg_sta/
 │   ├── reload.sh            reload the extension
 │   ├── psql.sh              psql as postgres over SSH or locally
 │   ├── load_sample_data.sh  load a demo schema, workload and advice
+│   ├── load_benchmark.sh    load the 10 x 1M row benchmark fixture
+│   ├── gen_upgrade.py       generate the upgrade scripts from the base script
+│   ├── lint_sql.py          static linter for the PL/pgSQL bodies
 │   └── installcheck.sh      run the regression suite
 ├── test/
 │   ├── qa_setup.sql         deliberate-defect fixture, split into phases
-│   ├── qa_assertions.sql    89 assertions
+│   ├── qa_assertions.sql    133 assertions
 │   └── run_qa.sh            the QA runner
 ├── packaging/pg_sta.spec    RPM package
 └── docs/                    the documentation set
@@ -301,7 +399,7 @@ pg_sta/
 
 ```bash
 make installcheck PG_CONFIG=/usr/pgsql-17/bin/pg_config   # regression suite
-make qa                                                     # QA suite (89 assertions)
+make qa                                                     # QA suite (133 assertions)
 ```
 
 The QA suite seeds a database with **deliberate defects** — an unanalysed
