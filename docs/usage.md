@@ -638,6 +638,28 @@ cd /var/lib/pgsql/pg_sta
 ./scripts/pg_sta_ctl --database appdb report
 ```
 
+> **Keep the copy on the host up to date.** The tree in
+> `/var/lib/pgsql/pg_sta` is a **copy** of the source tree; it is not
+> updated by `make install`. After a new version is installed, refresh it
+> so that the `postgres` user runs the same code as everybody else:
+>
+> ```bash
+> # on the database host
+> sudo -u postgres rm -rf /var/lib/pgsql/pg_sta.new
+> sudo -u postgres cp -a /home/vagrant/pg_sta /var/lib/pgsql/pg_sta.new
+> sudo -u postgres rm -rf /var/lib/pgsql/pg_sta.old
+> sudo mv /var/lib/pgsql/pg_sta /var/lib/pgsql/pg_sta.old
+> sudo mv /var/lib/pgsql/pg_sta.new /var/lib/pgsql/pg_sta
+> sudo chown -R postgres:postgres /var/lib/pgsql/pg_sta
+> ```
+>
+> A quick check that the copy matches the source tree:
+>
+> ```bash
+> diff -r /home/vagrant/pg_sta /var/lib/pgsql/pg_sta \
+>   --exclude=.git --exclude='*.o' --exclude='*.so'
+> ```
+
 When the transport falls back to the local client the scripts say so once:
 
 ```
