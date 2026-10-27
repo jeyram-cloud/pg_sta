@@ -174,6 +174,15 @@ answers the real question when a statement needs both — for example a join
 whose key is wrapped in a function such as `md5()`: the index alone cannot
 serve `md5(a) = md5(b)`, and the rewrite alone still reads every row.
 
+> **How much memory the measurement needs.** The row-by-row comparison turns
+> every row of both result sets into its JSON form and hashes it, so the
+> memory it needs grows with the size of the result set, not with the size
+> of the table. A statement that returns six million rows needs a few
+> gigabytes; on a small virtual machine the comparison swaps, and the
+> measurement takes minutes instead of seconds. Give the server enough
+> memory for the result set of the statement, or measure the statement on
+> a smaller slice of the data.
+
 ### Step 7 — read the result
 
 | Column | What it tells you |
