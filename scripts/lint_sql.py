@@ -33,7 +33,7 @@ TOKEN = re.compile(
   | (?P<str>'(?:[^']|'')*')
   | (?P<num>\d+(?:\.\d+)?)
   | (?P<ident>[A-Za-z_][A-Za-z0-9_$.]*)
-  | (?P<op>[^\sA-Za-z0-9_'"]+)""",
+  | (?P<op>[^\sA-Za-z0-9_$'""]+)""",
     re.VERBOSE)
 
 # %s, %I, %L, %1$s ... and the literal %% escape

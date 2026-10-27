@@ -48,6 +48,8 @@ cannot be validated is not a recommendation.
 | **Validation** | `sta.validate()` measures a candidate index against the current plan in a rolled-back subtransaction and returns a verdict |
 | **Before / after** | `sta.plan_before_after()` shows the plan of a statement **before** a change and **after** it, with the times and the buffer counts of both; `sta.before_after_benefit()` adds the benefit, the verdict and the plan change matrix |
 | **Before / after report** | `sta.before_after_report()` measures **every** recommended change against the statement it belongs to and returns the plan before, the plan after and the gain — for the whole workload, with every change rolled back |
+| **Before / after detail** | `sta.before_after_detail()` measures one statement against one change and returns the whole detail row: both plans, both readings, the gain and its basis, the buffer split, the row-by-row comparison and the assumption checks |
+| **Plan reading** | `sta.plan_explanation()` turns a plan into plain English — what each step does, what it costs and where the time goes; `sta.statement_explanation()` adds the statement text and the top three findings |
 | **Statement ids** | `sta.sql_id()` and `sta.sql_hash()` give the Oracle-style `SQL_ID` and `SQL_HASH`; `sta.queryid_info()` gives the `pg_stat_statements` query id, the normalised text and the workload of the statement |
 | **Explainability** | Every finding carries structured `evidence` (JSONB), not just prose |
 | **Clear errors** | A statement that names a relation of another database is reported as `sta.explain: the statement refers to a relation or a column that does not exist here`, with the message of the server as the detail and the connected database in the hint |
@@ -383,6 +385,50 @@ A statement that uses parameter placeholders (`$1`) cannot be run as it
 is; its generic plan is shown instead and the **estimated cost** is what
 is compared — the report says `ESTIMATED` instead of `MEASURED`.
 
+### The reading of the two plans
+
+A plan is a tree of numbers. `sta.plan_explanation()` turns it into
+words — what each step does, how many rows it estimated and how many it
+returned, where the time went and how the buffers were used — and every
+before/after measurement carries the reading of both plans:
+
+```console
+$ ./scripts/pg_sta_ctl --database appdb before-after-report \
+      "SELECT employee_id, employee_name FROM employees WHERE department_id = 2"
+```
+
+```
+--- reading of the plan before ------------------------------
+- gather
+    10,250 rows estimated, 10,000 rows returned, 14.321 ms, 7353 buffers hit
+  - seq scan on public.employees
+      filter: (employees.department_id = 2)
+      4,271 rows estimated, 3,333 rows returned, in 3 loops, 9.451 ms, 7353 buffers hit
+
+The plan is a parallel gather over employees. The outer side reads every row of employees. The step that costs the most is the seq scan on public.employees: 28.353 ms in total across 3 loops; the loops run at the same time, so the step can account for more than the 14.321 ms the statement took, and 7353 of the 7353 buffers. The statement returned 10,000 rows. Planning took 0.022 ms, the execution 14.511 ms, and the plan touched 7353 buffers, all of them from the cache.
+--- benefit -----------------------------------------------
+before:       15.214 ms
+after:        5.071 ms
+cost:         14586.3 -> 6315.4
+gain:         66.7 % (TIME)
+buffers:      7353 -> 7367 (-0.2 %)
+buffer split: 7353 hit / 0 read  ->  7356 hit / 11 read
+rows:         10000 -> 10000 (same number of rows: true)
+row by row:   (the change does not change the rows)
+assumptions:  (none)
+plan changed: true
+rows match:   true
+verdict:      RECOMMENDED
+```
+
+The gain always says **how it was measured**: `TIME` when the statement
+was really run on both sides, `COST` when only the estimated cost of
+the generic plan could be compared. A rewrite is checked row by row and
+its assumptions are tested — each check answers `PASS` or `FAIL`.
+
+`sta.before_after_detail()` returns all of it in one row, for one
+statement and one change.
+
 `sta.action_script()` carries the same information: with `p_plans` (the
 default) every step of the script holds the plan before the change, the
 plan after it, the measured gain and the verdict:
@@ -472,7 +518,7 @@ pg_sta: 38 finding(s)
       │
       ▼
   ┌───────────────────────────────────────────────────────────┐
-  │  SQL advisory layer (sql/pg_sta--0.1.4.sql)               │
+  │  SQL advisory layer (sql/pg_sta--0.1.5.sql)               │
   │    workload_advice()  plan_advice()  stats_advice()      │
   │    index_advice()     validate()     recommendations()   │
   │    action_plan()      action_script()                    │
@@ -517,11 +563,13 @@ pg_sta/
 ├── pg_sta.control           extension control file
 ├── src/pg_sta.c             C core: queryid, normalisation, EXPLAIN, server info
 ├── sql/
-│   ├── pg_sta--0.1.4.sql    the advisory engine (schema "sta")
-│   ├── pg_sta--0.1.0--0.1.4.sql   upgrade path from 0.1.0
-│   ├── pg_sta--0.1.1--0.1.4.sql   upgrade path from 0.1.1
-│   ├── pg_sta--0.1.2--0.1.4.sql   upgrade path from 0.1.2
-│   ├── pg_sta--0.1.3--0.1.4.sql   upgrade path from 0.1.3
+│   ├── pg_sta--0.1.5.sql    the advisory engine (schema "sta")
+│   ├── pg_sta--0.1.0--0.1.5.sql   upgrade path from 0.1.0
+│   ├── pg_sta--0.1.1--0.1.5.sql   upgrade path from 0.1.1
+│   ├── pg_sta--0.1.2--0.1.5.sql   upgrade path from 0.1.2
+│   ├── pg_sta--0.1.3--0.1.5.sql   upgrade path from 0.1.3
+│   ├── pg_sta--0.1.4--0.1.5.sql   upgrade path from 0.1.4
+│   ├── pg_sta--0.1.5--0.1.4.sql   downgrade path back to 0.1.4
 │   ├── pg_sta.sql           regression test
 │   ├── orders_workload.sql  a 10-statement workload for the demo schema
 │   ├── sample_data.sql      demo schema: orders, customers, workload
@@ -542,7 +590,7 @@ pg_sta/
 │   └── installcheck.sh      run the regression suite
 ├── test/
 │   ├── qa_setup.sql         deliberate-defect fixture, split into phases
-│   ├── qa_assertions.sql    204 assertions
+│   ├── qa_assertions.sql    232 assertions
 │   └── run_qa.sh            the QA runner
 ├── packaging/pg_sta.spec    RPM package
 └── docs/                    the documentation set
@@ -554,7 +602,7 @@ pg_sta/
 
 ```bash
 make installcheck PG_CONFIG=/usr/pgsql-17/bin/pg_config   # regression suite
-make qa                                                     # QA suite (204 assertions)
+make qa                                                     # QA suite (232 assertions)
 ```
 
 The QA suite seeds a database with **deliberate defects** — an unanalysed

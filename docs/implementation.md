@@ -21,7 +21,7 @@ How `pg_sta` is put together and how data flows through it.
 └──────────────────────────┬───────────────────────────────────┘
                            │  narrow C ABI (5 functions)
 ┌──────────────────────────▼───────────────────────────────────┐
-│  Layer 2 — SQL advisory engine   sql/pg_sta--0.1.4.sql      │
+│  Layer 2 — SQL advisory engine   sql/pg_sta--0.1.5.sql      │
 │                                                     (2070 lines)│
 │  Everything that is policy:                                   │
 │    • which observations matter                                │
@@ -125,7 +125,7 @@ advisor:
 
 ---
 
-## 3. The SQL advisory engine (`sql/pg_sta--0.1.4.sql`)
+## 3. The SQL advisory engine (`sql/pg_sta--0.1.5.sql`)
 
 ### 3.1 Schema and objects
 
@@ -177,6 +177,9 @@ Public functions:
 | `sta.action_plan(text, text, boolean, integer)` | the changes that implement the findings |
 | `sta.action_script(text, text, boolean, integer, boolean, integer)` | the action plan as one commented, runnable script, with the plan before and after every step |
 | `sta.before_after_report(text, text, integer, integer, boolean)` | the plan before and after the change, for every statement of the workload |
+| `sta.before_after_detail(text, text, text, integer)` | the whole detail of one change: both plans, both readings, the gain and its basis, the buffer split, the row comparison and the assumption checks |
+| `sta.plan_explanation(jsonb)` | the plan written out in words |
+| `sta.statement_explanation(text, boolean)` | the plan of a statement, written out in words, with the findings |
 | `sta.rewrite_statement(text)` | the rewritten statement, with the rules that fired |
 
 ### 3.1a The PostgreSQL 19 parity layer
@@ -399,10 +402,30 @@ Standard PGXS. `Makefile`:
 EXTENSION   = pg_sta
 MODULE_big  = pg_sta
 OBJS        = src/pg_sta.o
-DATA        = sql/pg_sta--0.1.4.sql
+DATA        = sql/pg_sta--0.1.5.sql \
+             sql/pg_sta--0.1.0--0.1.5.sql \
+             sql/pg_sta--0.1.1--0.1.5.sql \
+             sql/pg_sta--0.1.2--0.1.5.sql \
+             sql/pg_sta--0.1.3--0.1.5.sql \
+             sql/pg_sta--0.1.4--0.1.5.sql \
+             sql/pg_sta--0.1.5--0.1.4.sql
 REGRESS     = pg_sta
 REGRESS_OPTS ?= --dbname=pg_sta_regress
 ```
+
+The upgrade scripts are generated from the base script, so they can never
+drift away from it:
+
+```bash
+make upgrade-script    # regenerates every pg_sta--<from>--0.1.5.sql
+```
+
+`pg_sta--0.1.5--0.1.4.sql` is the **downgrade** script: it restores the
+0.1.4 function bodies and drops the functions that 0.1.5 added or whose
+arguments or return type changed. It is what makes an upgrade
+reversible — `ALTER EXTENSION pg_sta UPDATE TO '0.1.4'` then
+`ALTER EXTENSION pg_sta UPDATE TO '0.1.5'` leaves the database with the
+new bodies.
 
 ```bash
 make PG_CONFIG=/usr/pgsql-17/bin/pg_config              # compile

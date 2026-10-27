@@ -652,6 +652,8 @@ the procedure cannot drift apart.
 | `NO_SIGNIFICANT_CHANGE` | The plan changed but the timing difference is below 5 %. |
 | `NOT_USED` | The plan signature did not change: the planner did not pick the index. The timing difference is noise. |
 | `NOT_COMPARABLE` | The two runs returned different row counts. The measurement is meaningless. |
+| `ROWS_DIFFER` | The rewritten statement returns different rows than the original. |
+| `NO_CHANGE_NEEDED` | No change is recommended for this statement. |
 | `ERROR` | The candidate run failed. See `notes`. |
 
 ---

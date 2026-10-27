@@ -222,6 +222,8 @@ the same thing:
 | `REJECTED` | The plan changed but the change was **slower**. |
 | `NO_SIGNIFICANT_CHANGE` | The plan changed, but the timing is within the noise. |
 | `NOT_COMPARABLE` | The two sides returned a different number of rows. |
+| `ROWS_DIFFER` | The rewritten statement returns different rows than the original. |
+| `NO_CHANGE_NEEDED` | No change is recommended, so there is nothing to measure. |
 | `ERROR` | The statement or the change failed; see `notes`. |
 
 ### 2a.4 `sta.before_after_report()` — the report for the whole workload
@@ -271,6 +273,71 @@ The change is the rewritten statement, so the "after" plan is the plan of the ne
 The change was applied in a subtransaction and rolled back; the database is unchanged.
 The plan before and after could not be measured: the statement this change belongs to was not found in the workload.
 ```
+
+### 2a.5 `sta.before_after_detail()` — the whole detail of one change
+
+`sta.before_after_detail()` measures one statement against one change and
+returns the complete detail in a single row. It is the function behind
+the `before-after` and `before-after-report` commands of the command line
+client.
+
+```sql
+SELECT * FROM sta.before_after_detail(
+    p_sql         => 'SELECT employee_id, employee_name FROM employees WHERE department_id = 2',
+    p_change      => 'CREATE INDEX idx_employees_department_id ON public.employees (department_id)',
+    p_change_type => 'AUTO',
+    p_iterations  => 3);
+```
+
+| Argument | Type | Meaning |
+|---|---|---|
+| `p_sql` | `text` | the statement to measure |
+| `p_change` | `text` | the change to measure |
+| `p_change_type` | `text` | `AUTO` detects the type from the change; `NONE`, `CREATE_INDEX`, `ANALYZE`, `VACUUM_ANALYZE` or `REWRITE` force it |
+| `p_iterations` | `integer` | how many times each side is measured (1–20, default 3) |
+
+The row carries, besides the two plans:
+
+| Column | What it holds |
+|---|---|
+| `before_reading`, `after_reading` | the two plans written out in words |
+| `improvement_pct` | the gain in percent |
+| `benefit_basis` | `TIME` when the gain was measured in time, `COST` when only the estimated cost could be compared, `NONE` when there is no change |
+| `before_hit`, `before_read`, `after_hit`, `after_read` | the buffers of the two runs, split into cache hits and disk reads |
+| `buffer_change_pct` | how much fewer buffers the change touched |
+| `comparison` | the row-by-row comparison of a rewrite, as JSONB |
+| `rows_identical`, `order_preserved` | the outcome of that comparison |
+| `assumptions` | the assumption checks of a rewrite, each with its `status` (`PASS` or `FAIL`), the check that was run and its result |
+| `plan_changed` | whether the plan shape changed |
+| `rows_match` | whether the two runs returned the same number of rows |
+| `verdict` | one of the verdicts of §2a.3 |
+| `node_changes` | the plan change matrix |
+| `notes` | what was done, and what could not be measured |
+
+> **The gain is only as good as its basis.** `benefit_basis = 'TIME'`
+> means the statement was actually run several times on both sides and the
+> averages were compared. `benefit_basis = 'COST'` means the statement
+> could not be run — it uses parameter placeholders — and the estimated
+> cost of the generic plan is what was compared. A gain in cost is not a
+> gain in time; read it as an estimate.
+
+### 2a.6 The row-by-row comparison and the assumption checks
+
+A rewrite changes what the statement returns, so it has to be checked
+against the original:
+
+* **the row-by-row comparison** (`comparison`) runs the original and the
+  rewritten statement, compares the rows and reports how many rows are in
+  both, how many are only in the original and how many are only in the
+  rewrite. `rows_identical` is `true` only when the two sets are the
+  same. When the statement has no `ORDER BY`, the order is not compared
+  (`order_comparable` is `false`).
+* **the assumption checks** (`assumptions`) test the premises the rewrite
+  depends on. Each check returns `PASS` or `FAIL`, the check that was run
+  and its result.
+
+When the comparison fails, the verdict is `ROWS_DIFFER` and the rewrite
+must not be used as it is.
 
 ---
 

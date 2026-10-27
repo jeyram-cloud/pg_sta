@@ -143,7 +143,7 @@ The developer scripts in `scripts/` do this automatically:
 | Path | Purpose |
 |---|---|
 | `src/pg_sta.c` | the C core: plan capture, query ids, server introspection |
-| `sql/pg_sta--0.1.4.sql` | the advisory engine, the catalogue and the sample tables |
+| `sql/pg_sta--0.1.5.sql` | the advisory engine, the catalogue and the sample tables |
 | `sql/pg_sta.sql` | the regression suite (pg_regress) |
 | `sql/sample_data.sql`, `sql/sample_workload.sql` | the demo schema and the demo workload |
 | `scripts/pg_sta_ctl` | the command line client |
@@ -189,7 +189,7 @@ sudo make PG_CONFIG=/usr/pgsql-17/bin/pg_config install
 
 - `pg_sta.so` → `$(pg_config --pkglibdir)`
 - `pg_sta.control` → `$(pg_config --sharedir)/extension`
-- `pg_sta--0.1.4.sql` → `$(pg_config --sharedir)/extension`
+- `pg_sta--0.1.5.sql` → `$(pg_config --sharedir)/extension`
 
 ---
 
@@ -251,6 +251,43 @@ ever dropped.
 
 > The fixture writes to the `public` schema of the target database. Use a
 > scratch database, never a production one.
+
+### 4.2 Upgrading and downgrading an existing installation
+
+The advisor is upgraded in place, so the collected workload and the audit
+trail survive the upgrade:
+
+```sql
+ALTER EXTENSION pg_sta UPDATE TO '0.1.5';
+```
+
+A script is provided for every step of the way, so a database on any
+older version can reach the newest one in one command:
+
+| Script | From | To |
+|---|---|---|
+| `pg_sta--0.1.0--0.1.5.sql` | 0.1.0 | 0.1.5 |
+| `pg_sta--0.1.1--0.1.5.sql` | 0.1.1 | 0.1.5 |
+| `pg_sta--0.1.2--0.1.5.sql` | 0.1.2 | 0.1.5 |
+| `pg_sta--0.1.3--0.1.5.sql` | 0.1.3 | 0.1.5 |
+| `pg_sta--0.1.4--0.1.5.sql` | 0.1.4 | 0.1.5 |
+
+The newest version can also be taken back one step:
+
+```sql
+ALTER EXTENSION pg_sta UPDATE TO '0.1.4';
+```
+
+The downgrade script `pg_sta--0.1.5--0.1.4.sql` restores the bodies of
+the 0.1.4 functions and drops the ones that 0.1.5 added. It is needed
+because a function body cannot be replaced by `CREATE OR REPLACE` when
+its arguments **or its return type** changed.
+
+> **Why the upgrade script and not `psql -f`?** The members of an
+> extension cannot be replaced from outside: PostgreSQL refuses to drop
+> a function that the extension owns. Only an `ALTER EXTENSION … UPDATE`
+> can replace them, because it runs the upgrade script inside the
+> extension's own transaction.
 
 ---
 
@@ -724,9 +761,57 @@ Two restrictions apply:
 | `REJECTED` | The plan changed but the change was **slower**. |
 | `NO_SIGNIFICANT_CHANGE` | The plan changed, but the timing is within the noise. |
 | `NOT_COMPARABLE` | The two runs returned a different number of rows. |
+| `ROWS_DIFFER` | The rewritten statement returns **different rows** than the original; it cannot be used as it is. |
+| `NO_CHANGE_NEEDED` | No change is recommended for this statement, so there is no benefit to measure. |
 | `ERROR` | The statement or the change failed; see `notes`. |
 
-### 7.5 The before/after report for the whole workload
+The report adds `NOT_MEASURED` for a row whose measurement failed.
+
+### 7.5 The detail of one change
+
+`sta.before_after_detail()` measures **one** statement against **one**
+change and returns the whole detail in a single row: the two plans, the
+reading of each plan, the gain and the basis it was measured on, the
+buffer split, the row-by-row comparison and the result of the assumption
+checks.
+
+```sql
+SELECT statement, change_type, change_sql,
+       before_ms, after_ms, improvement_pct, benefit_basis,
+       before_hit, before_read, after_hit, after_read,
+       before_buffers, after_buffers, buffer_change_pct,
+       rows_identical, order_preserved, rows_match,
+       verdict, plan_changed, notes
+FROM   sta.before_after_detail(
+           p_sql        => 'SELECT employee_id, employee_name FROM employees WHERE department_id = 2',
+           p_change     => 'CREATE INDEX idx_employees_department_id ON public.employees (department_id)',
+           p_change_type => 'AUTO',
+           p_iterations => 3);
+```
+
+| Column | What it holds |
+|---|---|
+| `statement` | the statement that was measured |
+| `change_type` | the resolved type: `NONE`, `CREATE_INDEX`, `ANALYZE`, `VACUUM_ANALYZE` or `REWRITE` |
+| `change_sql` | the change, as it was applied |
+| `before_plan`, `after_plan` | the two plans, in full |
+| `before_reading`, `after_reading` | the two plans written out in words (§7.7) |
+| `before_ms`, `after_ms` | the measured times |
+| `improvement_pct` | the gain in percent |
+| `benefit_basis` | `TIME` when the gain was measured in time, `COST` when only the estimated cost could be compared, `NONE` when there is no change |
+| `before_hit`, `before_read`, `after_hit`, `after_read` | the buffers of the two runs, split into cache hits and disk reads |
+| `buffer_change_pct` | how much fewer buffers the change touched |
+| `rows_identical`, `order_preserved` | the result of the row-by-row comparison of a rewrite |
+| `comparison` | the row-by-row comparison itself, as JSONB |
+| `assumptions` | the assumption checks of a rewrite, each with its `status` (`PASS`/`FAIL`), its check and its result |
+| `rows_match` | whether the two runs returned the same number of rows |
+| `plan_changed` | whether the plan changed at all |
+| `verdict` | one of the verdicts of §7.4 |
+
+`AUTO` resolves to the type of the change, so the function can be called
+with the change alone.
+
+### 7.6 The before/after report for the whole workload
 
 `sta.plan_before_after()` measures **one** statement against **one**
 change. `sta.before_after_report()` does the same for **every statement of
@@ -789,6 +874,40 @@ database.
 A statement that no change applies to still gets a row, with the change
 type `NONE` and the verdict `NOT_USED`: the report covers the whole
 workload, not only the statements that can be improved.
+
+### 7.7 The reading of a plan
+
+A plan is a tree of numbers. `sta.plan_explanation()` turns it into
+words: what each step does, how many rows it estimated and how many it
+returned, where the time went and how the buffers were used.
+
+```sql
+SELECT sta.plan_explanation(sta.explain(
+           'SELECT employee_id, employee_name FROM employees WHERE department_id = 2',
+           true));
+```
+
+```
+- gather
+    10,250 rows estimated, 10,000 rows returned, 14.640 ms, 7353 buffers hit
+  - seq scan on public.employees
+      filter: (employees.department_id = 2)
+      4,271 rows estimated, 3,333 rows returned, in 3 loops, 9.116 ms, 7353 buffers hit
+
+The plan is a parallel gather over employees. The outer side reads every row of employees. The step that costs the most is the seq scan on public.employees: 27.348 ms in total across 3 loops; the loops run at the same time, so the step can account for more than the 14.640 ms the statement took, and 7353 of the 7353 buffers. The statement returned 10,000 rows. Planning took 0.076 ms, the execution 14.832 ms, and the plan touched 7353 buffers, all of them from the cache.
+```
+
+`sta.statement_explanation()` adds the statement itself and the findings
+of the advisor for that statement:
+
+```sql
+SELECT sta.statement_explanation(
+           'SELECT employee_id, employee_name FROM employees WHERE department_id = 2',
+           true);
+```
+
+The reading is used by the action script and by the before/after report,
+so every measurement comes with its explanation.
 
 ---
 
@@ -918,6 +1037,10 @@ The verdict is one of:
 # the plan before and after the change, for every statement of the workload
 ./scripts/pg_sta_ctl -d appdb --statements 5 before-after-report
 
+# the plan of a statement, written out in words
+./scripts/pg_sta_ctl -d appdb --analyze plan-explanation \
+    "SELECT employee_id, employee_name FROM employees WHERE department_id = 2"
+
 # the whole plan as one script, with the plan before and after every step
 ./scripts/pg_sta_ctl -d appdb --statements 5 script --plans > fix.sql
 ./scripts/pg_sta_ctl -d appdb --statements 5 script --no-plans > fix.sql
@@ -988,6 +1111,7 @@ pg_sta_ctl: the pg_sta extension is not installed in database 'appdb'.
 | `script [SQL]` | the whole plan as one commented, runnable file (`--plans` / `--no-plans`) |
 | `before-after SQL [CHANGE]` | the plan before and after a change, and the benefit of the change |
 | `before-after-report [SQL]` | the plan before and after the change, for every statement of the workload |
+| `plan-explanation SQL` | the plan of a statement, written out in words |
 | `queryid SQL` | the canonical query id and its normalised text |
 | `sqlid SQL` | every identifier of a statement: query id, SQL id, SQL hash |
 | `explain SQL` | the execution plan as JSON |
@@ -1039,11 +1163,29 @@ Index Scan using idx_od_order_id on order_details  (cost=0.42..2.64 rows=1 width
 Planning Time: 0.006 ms
 Execution Time: 0.004 ms
 
+--- reading of the plan before ---------------------------------
+- gather
+    1 rows estimated, 1 rows returned, 13.006 ms, 7353 buffers hit
+  - parallel seq scan on public.order_details
+      filter: (order_details.order_id = 500000)
+      1 rows estimated, 0 rows returned, in 3 loops, 9.741 ms, 7353 buffers hit
+
+The plan is a parallel gather over order_details. The outer side reads every row of order_details. The step that costs the most is the parallel seq scan on public.order_details: 29.223 ms in total across 3 loops; the loops run at the same time, so the step can account for more than the 13.006 ms the statement took, and 7353 of the 7353 buffers. The statement returned 1 row. Planning took 0.021 ms, the execution 13.125 ms, and the plan touched 7353 buffers, all of them from the cache.
+--- reading of the plan after ----------------------------------
+- index scan using idx_od_order_id on public.order_details
+    index cond: (order_details.order_id = 500000)
+    1 rows estimated, 1 rows returned, 0.011 ms, 4 buffers hit
+
+The plan is an index scan using idx_od_order_id on order_details. The step that costs the most is the index scan using idx_od_order_id: 0.011 ms of the 0.011 ms in total, and 4 of the 4 buffers. The statement returned 1 row. Planning took 0.006 ms, the execution 0.004 ms, and the plan touched 4 buffers, all of them from the cache.
 --- benefit ----------------------------------------------------
 before:      13.661 ms
 after:       0.014 ms
-improvement: 99.90 %
-buffers:     7353 -> 1 shared hit
+improvement: 99.90 % (TIME)
+buffers:     7353 -> 4 total
+buffer split: 7353 hit / 0 read  ->  4 hit / 0 read
+rows:        1 -> 1 (same number of rows: true)
+row by row:  (the change does not change the rows)
+assumptions: (none)
 plan changed: true
 rows match:   true
 verdict:      RECOMMENDED
@@ -1052,6 +1194,30 @@ plan changes:
   Seq Scan on public.order_details  ->  (removed)
 notes:
 The change was applied in a subtransaction and rolled back; the database is unchanged.
+```
+
+For a **rewrite** the command also prints the row-by-row comparison and
+the result of the assumption checks:
+
+```console
+row by row:  {"before_rows": "1", "after_rows": "1", "rows_in_both": "1",
+              "only_before": "0", "only_after": "0", "rows_identical": true,
+              "order_comparable": false}
+assumptions: [{"pattern": "SELECT_STAR", "status": "PASS", ...}]
+```
+
+### 10.1a The plan written out in words
+
+```console
+$ ./scripts/pg_sta_ctl -d appdb --analyze plan-explanation \
+      "SELECT employee_id, employee_name FROM employees WHERE department_id = 2"
+- gather
+    10,250 rows estimated, 10,000 rows returned, 14.640 ms, 7353 buffers hit
+  - seq scan on public.employees
+      filter: (employees.department_id = 2)
+      4,271 rows estimated, 3,333 rows returned, in 3 loops, 9.116 ms, 7353 buffers hit
+
+The plan is a parallel gather over employees. The outer side reads every row of employees. The step that costs the most is the seq scan on public.employees: 27.348 ms in total across 3 loops; the loops run at the same time, so the step can account for more than the 14.640 ms the statement took, and 7353 of the 7353 buffers. The statement returned 10,000 rows. Planning took 0.076 ms, the execution 14.832 ms, and the plan touched 7353 buffers, all of them from the cache.
 ```
 
 ### 10.2 The identifiers of a statement from the command line
@@ -1152,7 +1318,12 @@ Merge Anti Join  (cost=16139.88..43104.48 rows=995000 width=24)
 before:       - ms
 after:        - ms
 cost:         34714.8 -> 43104.5
-gain:         -24.2 %
+gain:         -24.2 % (COST)
+buffers:      - -> -
+buffer split: - hit / - read  ->  - hit / - read
+rows:         - -> -
+row by row:   (the change does not change the rows)
+assumptions:  (none)
 plan changed: true
 rows match:   true
 verdict:      REJECTED
@@ -1228,7 +1399,7 @@ UPDATE sta.threshold SET value = 0.05 WHERE name = 'dead_tuple_ratio';
 To restore the defaults, re-run the extension script:
 
 ```sql
-\i /usr/pgsql-17/share/extension/pg_sta--0.1.4.sql
+\i /usr/pgsql-17/share/extension/pg_sta--0.1.5.sql
 ```
 
 ### 11.1 Server settings

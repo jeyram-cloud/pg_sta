@@ -43,6 +43,7 @@
 #                            the plan before and after the change for every
 #                            statement of the workload, with the benefit of
 #                            every change
+#   plan-explanation SQL      the plan of a statement, written out in words
 #   validate DDL SQL         measure a proposed index against the current plan
 #   queryid SQL              the canonical query id of a statement
 #   sqlid SQL                every identifier of a statement, the Oracle way
@@ -155,7 +156,7 @@ done
 COMMAND="$1"; shift
 
 case "$COMMAND" in
-    plan|index|rewrite|queryid|explain|plan-advice)
+    plan|index|rewrite|queryid|explain|plan-advice|plan-explanation)
         [ $# -ge 1 ] || die "$COMMAND needs a SQL statement"
         SQL_ARG="$1"; shift ;;
     advice)
@@ -590,15 +591,44 @@ SELECT 'pg_sta: the plan before and after the change, for every statement' || E'
            coalesce(r.before_plan, '(no plan)') || E'\n' ||
            E'--- PLAN AFTER ---------------------------------------------\n' ||
            coalesce(r.after_plan, '(no plan)') || E'\n' ||
+           E'--- reading of the plan before ------------------------------\n' ||
+           coalesce(r.before_reading, '(none)') || E'\n' ||
+           E'--- reading of the plan after -------------------------------\n' ||
+           coalesce(r.after_reading, '(none)') || E'\n' ||
            E'--- benefit -----------------------------------------------\n' ||
            'before:       ' || coalesce(round(r.before_ms::numeric, 3)::text, '-') || ' ms' || E'\n' ||
            'after:        ' || coalesce(round(r.after_ms::numeric, 3)::text, '-') || ' ms' || E'\n' ||
            'cost:         ' || coalesce(round(r.before_cost::numeric, 1)::text, '-') || ' -> ' ||
                             coalesce(round(r.after_cost::numeric, 1)::text, '-') || E'\n' ||
-           'gain:         ' || coalesce(round(r.improvement_pct::numeric, 1)::text, '-') || ' %' || E'\n' ||
-           'plan changed: ' || r.plan_changed::text || E'\n' ||
-           'rows match:   ' || r.rows_match::text || E'\n' ||
-           'verdict:      ' || r.verdict || E'\n' ||
+           'gain:         ' || coalesce(round(r.improvement_pct::numeric, 1)::text, '-') || ' %' ||
+                            CASE WHEN r.benefit_basis IS NOT NULL
+                                 THEN ' (' || r.benefit_basis || ')' ELSE '' END || E'\n' ||
+           'buffers:      ' || coalesce(r.before_buffers::text, '-') || ' -> ' ||
+                            coalesce(r.after_buffers::text, '-') ||
+                            CASE WHEN r.buffer_change_pct IS NOT NULL
+                                 THEN ' (' || round(r.buffer_change_pct::numeric, 1)::text || ' %)' ELSE '' END ||
+                            E'\n' ||
+           'buffer split: ' || coalesce(r.before_hit::text, '-') || ' hit / ' ||
+                            coalesce(r.before_read::text, '-') || ' read  ->  ' ||
+                            coalesce(r.after_hit::text, '-') || ' hit / ' ||
+                            coalesce(r.after_read::text, '-') || ' read' || E'\n' ||
+           'rows:         ' || coalesce(r.before_rows::text, '-') || ' -> ' ||
+                            coalesce(r.after_rows::text, '-') ||
+                            CASE WHEN r.rows_identical IS NOT NULL
+                                 THEN ' (identical: ' || r.rows_identical::text ||
+                                      ', order preserved: ' ||
+                                      coalesce(r.order_preserved::text, 'not checked') || ')'
+                                 WHEN r.rows_match IS NOT NULL
+                                 THEN ' (same number of rows: ' || r.rows_match::text || ')'
+                                 ELSE '' END || E'\n' ||
+           'row by row:   ' ||
+                            CASE WHEN r.comparison IS NOT NULL
+                                 THEN coalesce(r.comparison::text, '(not compared)')
+                                 ELSE '(the change does not change the rows)' END || E'\n' ||
+           'assumptions:  ' || coalesce(nullif(r.assumptions::text, '[]'), '(none)') || E'\n' ||
+           'plan changed: ' || coalesce(r.plan_changed::text, '-') || E'\n' ||
+           'rows match:   ' || coalesce(r.rows_match::text, '-') || E'\n' ||
+           'verdict:      ' || coalesce(r.verdict, '-') || E'\n' ||
            'plan changes:' || E'\n' ||
            coalesce(array_to_string(r.node_changes, E'\n'), '(none)') || E'\n' ||
            'notes:' || E'\n' ||
@@ -609,45 +639,70 @@ SQL
     ;;
 
 before-after)
-    # The plan of the statement before and after the change, and the benefit
-    # of the change.  The change is rolled back: nothing is left behind.
+    # The plan of the statement before and after the change, the reading
+    # of both plans and the benefit of the change.  The change is rolled
+    # back: nothing is left behind.
     if [ -n "$CHANGE_ARG" ]; then
         chg=$(sql_literal "$CHANGE_ARG")
     else
         chg="NULL"
     fi
     cat <<SQL | run_sql "-q -A -t"
-WITH ba AS (
-    SELECT b.phase, b.change_type, b.change_sql, b.statement, b.plan_text,
-           b.exec_ms, b.best_ms, b.actual_rows, b.shared_hit, b.shared_read,
-           b.node_type, b.index_name, b.signature, b.notes
-    FROM sta.plan_before_after($(sql_literal "$SQL_ARG"), $chg, 'AUTO', $ITERATIONS) b
-),
-bn AS (
-    SELECT * FROM sta.before_after_benefit($(sql_literal "$SQL_ARG"), $chg, 'AUTO', $ITERATIONS)
-)
 SELECT 'pg_sta: the plan before and after the change' || E'\n\n' ||
-       'statement:  ' || coalesce((SELECT statement FROM ba WHERE phase = 'BEFORE'), '-') || E'\n' ||
-       'change:     ' || coalesce((SELECT change_sql FROM ba WHERE phase = 'BEFORE'), '(none)') || E'\n' ||
-       'change type: ' || coalesce((SELECT change_type FROM ba WHERE phase = 'BEFORE'), '-') || E'\n' ||
+       'statement:  ' || coalesce(d.statement, '-') || E'\n' ||
+       'change:     ' || coalesce(d.change_sql, '(none)') || E'\n' ||
+       'change type: ' || coalesce(d.change_type, '-') || E'\n' ||
        E'\n' ||
        '--- BEFORE -----------------------------------------------------' || E'\n' ||
-       coalesce((SELECT plan_text FROM ba WHERE phase = 'BEFORE'), '(no plan)') || E'\n' ||
+       coalesce(d.before_plan, '(no plan)') || E'\n' ||
        '--- AFTER ------------------------------------------------------' || E'\n' ||
-       coalesce((SELECT plan_text FROM ba WHERE phase = 'AFTER'), '(no plan)') || E'\n' ||
+       coalesce(d.after_plan, '(no plan)') || E'\n' ||
+       '--- reading of the plan before ---------------------------------' || E'\n' ||
+       coalesce(d.before_reading, '(none)') || E'\n' ||
+       '--- reading of the plan after ----------------------------------' || E'\n' ||
+       coalesce(d.after_reading, '(none)') || E'\n' ||
        '--- benefit ----------------------------------------------------' || E'\n' ||
-       'before:      ' || round((SELECT before_ms FROM bn)::numeric, 3) || ' ms' || E'\n' ||
-       'after:       ' || round((SELECT after_ms FROM bn)::numeric, 3) || ' ms' || E'\n' ||
-       'improvement: ' || round((SELECT improvement_pct FROM bn)::numeric, 2) || ' %' || E'\n' ||
-       'buffers:     ' || (SELECT before_hit FROM bn) || ' -> ' || (SELECT after_hit FROM bn) ||
-           ' shared hit' || E'\n' ||
-       'plan changed: ' || (SELECT plan_changed::text FROM bn) || E'\n' ||
-       'rows match:   ' || (SELECT rows_match::text FROM bn) || E'\n' ||
-       'verdict:      ' || (SELECT verdict FROM bn) || E'\n' ||
+       'before:      ' || coalesce(round(d.before_ms::numeric, 3)::text, '-') || ' ms' || E'\n' ||
+       'after:       ' || coalesce(round(d.after_ms::numeric, 3)::text, '-') || ' ms' || E'\n' ||
+       'improvement: ' || coalesce(round(d.improvement_pct::numeric, 2)::text, '-') || ' %' ||
+           CASE WHEN d.benefit_basis IS NOT NULL
+                THEN ' (' || d.benefit_basis || ')' ELSE '' END || E'\n' ||
+       'buffers:     ' || coalesce(d.before_buffers::text, '-') || ' -> ' ||
+           coalesce(d.after_buffers::text, '-') || ' total' || E'\n' ||
+       'buffer split: ' || coalesce(d.before_hit::text, '-') || ' hit / ' ||
+           coalesce(d.before_read::text, '-') || ' read  ->  ' ||
+           coalesce(d.after_hit::text, '-') || ' hit / ' ||
+           coalesce(d.after_read::text, '-') || ' read' || E'\n' ||
+       'rows:        ' || coalesce(d.before_rows::text, '-') || ' -> ' ||
+           coalesce(d.after_rows::text, '-') ||
+           CASE WHEN d.rows_identical IS NOT NULL
+                THEN ' (identical: ' || d.rows_identical::text ||
+                     ', order preserved: ' ||
+                     coalesce(d.order_preserved::text, 'not checked') || ')'
+                WHEN d.rows_match IS NOT NULL
+                THEN ' (same number of rows: ' || d.rows_match::text || ')'
+                ELSE '' END || E'\n' ||
+       'row by row:  ' ||
+           CASE WHEN d.comparison IS NOT NULL
+                THEN coalesce(d.comparison::text, '(not compared)')
+                ELSE '(the change does not change the rows)' END || E'\n' ||
+       'assumptions: ' || coalesce(nullif(d.assumptions::text, '[]'), '(none)') || E'\n' ||
+       'plan changed: ' || coalesce(d.plan_changed::text, '-') || E'\n' ||
+       'rows match:   ' || coalesce(d.rows_match::text, '-') || E'\n' ||
+       'verdict:      ' || coalesce(d.verdict, '-') || E'\n' ||
        'plan changes:' || E'\n' ||
-       coalesce((SELECT array_to_string(node_changes, E'\n') FROM bn), '(none)') || E'\n' ||
+       coalesce(array_to_string(d.node_changes, E'\n'), '(none)') || E'\n' ||
        'notes:' || E'\n' ||
-       coalesce((SELECT array_to_string(notes, E'\n') FROM bn), '(none)');
+       coalesce(array_to_string(d.notes, E'\n'), '(none)')
+FROM sta.before_after_detail($(sql_literal "$SQL_ARG"), $chg, 'AUTO', $ITERATIONS) d;
+SQL
+    ;;
+
+plan-explanation)
+    # The plan of the statement, written out in words: what it does, what
+    # it costs and where the time goes.
+    cat <<SQL | run_sql "-q -A -t"
+SELECT coalesce(sta.statement_explanation($(sql_literal "$SQL_ARG"), $ANALYZE), '(no plan)');
 SQL
     ;;
 

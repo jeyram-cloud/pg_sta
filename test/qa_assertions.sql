@@ -1746,7 +1746,8 @@ BEGIN
 
     SELECT count(*) INTO v_cnt FROM qa_report
      WHERE verdict NOT IN ('RECOMMENDED', 'REJECTED', 'NO_SIGNIFICANT_CHANGE',
-                           'NOT_USED', 'NOT_COMPARABLE', 'NOT_MEASURED');
+                           'NOT_USED', 'NOT_COMPARABLE', 'NOT_MEASURED',
+                           'ROWS_DIFFER', 'NO_CHANGE_NEEDED');
     INSERT INTO qa_result VALUES (default,
         'before_after_report: the verdict is one of the known values',
         '0', v_cnt::text, v_cnt = 0);
@@ -1985,6 +1986,213 @@ BEGIN
         'the relation that does not exist',
         coalesce(v_detail, '(none)'),
         coalesce(v_detail, '') LIKE '%does not exist%');
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- 17. The reading of the plan, the row comparison and the checks
+-- -------------------------------------------------------------------------
+--
+-- Every recommendation has to be readable by a human: the plan before and
+-- the plan after are written out in words, the rows of the two statements
+-- are compared one by one, and the assumptions the rewrite depends on are
+-- checked against the database.  A change is applied in a subtransaction
+-- and rolled back, so the QA database is left exactly as it was.
+DO $$
+DECLARE
+    v_cnt       int;
+    v_reading   text;
+    v_reading2  text;
+    v_detail    record;
+    v_cmp       jsonb;
+    v_status    text;
+    v_script    text;
+    v_sql       text := 'SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 7';
+    v_rewrite   text := 'SELECT id, dim1_id, dim2_id FROM sta_qa.pa_fact WHERE dim1_id = 7';
+    v_ddl       text := 'CREATE INDEX qa_bd_fact_dim1 ON sta_qa.pa_fact (dim1_id)';
+BEGIN
+    ------------------------------------------------------------------
+    -- The plan, written out in words
+    ------------------------------------------------------------------
+    v_reading := sta.statement_explanation(v_sql, true);
+    INSERT INTO qa_result VALUES (default,
+        'plan explanation: the plan is described in words',
+        'The plan is', coalesce(substr(v_reading, 1, 80), '(none)'),
+        coalesce(v_reading, '') LIKE '%The plan is%');
+
+    INSERT INTO qa_result VALUES (default,
+        'plan explanation: the description names the relation',
+        'pa_fact', coalesce(substr(v_reading, 1, 200), '(none)'),
+        coalesce(v_reading, '') LIKE '%pa_fact%');
+
+    v_reading2 := sta.plan_explanation(sta.explain(v_sql, false));
+    INSERT INTO qa_result VALUES (default,
+        'plan explanation: a plan that was not measured says so',
+        'not measured', coalesce(substr(v_reading2, 1, 200), '(none)'),
+        coalesce(v_reading2, '') LIKE '%not measured%');
+
+    ------------------------------------------------------------------
+    -- The rows of the two statements, compared one by one
+    ------------------------------------------------------------------
+    SELECT * INTO v_cmp FROM sta._compare_results(v_sql, v_sql);
+    INSERT INTO qa_result VALUES (default,
+        'row comparison: the same statement gives the same rows',
+        'true', coalesce((v_cmp->>'rows_identical')::text, 'null'),
+        coalesce((v_cmp->>'rows_identical')::boolean, false) = true);
+
+    INSERT INTO qa_result VALUES (default,
+        'row comparison: the rows in both are counted',
+        (SELECT count(*)::text FROM sta_qa.pa_fact WHERE dim1_id = 7),
+        coalesce((v_cmp->>'rows_in_both')::text, 'null'),
+        coalesce((v_cmp->>'rows_in_both')::bigint, -1) =
+        (SELECT count(*) FROM sta_qa.pa_fact WHERE dim1_id = 7));
+
+    SELECT * INTO v_cmp FROM sta._compare_results(v_sql, v_rewrite);
+    INSERT INTO qa_result VALUES (default,
+        'row comparison: the rewrite gives the same rows as the original',
+        'true', coalesce((v_cmp->>'rows_identical')::text, 'null'),
+        coalesce((v_cmp->>'rows_identical')::boolean, false) = true);
+
+    ------------------------------------------------------------------
+    -- The assumptions of the rewrite, checked against the database
+    ------------------------------------------------------------------
+    SELECT status INTO v_status FROM sta.assumption_checks('SELECT_STAR', v_sql, v_rewrite)
+     ORDER BY check_id LIMIT 1;
+    INSERT INTO qa_result VALUES (default,
+        'assumption checks: the status of a check is known',
+        'PASS', coalesce(v_status, 'null'),
+        coalesce(v_status, '') IN ('PASS', 'FAIL'));
+
+    SELECT count(*) INTO v_cnt FROM sta.assumption_checks('SELECT_STAR', v_sql, v_rewrite);
+    INSERT INTO qa_result VALUES (default,
+        'assumption checks: every check of a rewrite is reported',
+        '>=1', v_cnt::text, v_cnt >= 1);
+
+    SELECT count(*) INTO v_cnt FROM sta.assumption_checks('SELECT_STAR', v_sql, v_rewrite)
+     WHERE status = 'PASS';
+    INSERT INTO qa_result VALUES (default,
+        'assumption checks: the rewrite of the fixture passes its checks',
+        '>=1', v_cnt::text, v_cnt >= 1);
+
+    ------------------------------------------------------------------
+    -- The whole detail of one statement before and after a change
+    ------------------------------------------------------------------
+    SELECT * INTO v_detail FROM sta.before_after_detail(v_sql, v_ddl, 'AUTO', 2);
+    INSERT INTO qa_result VALUES (default,
+        'before_after_detail: the change type is detected',
+        'CREATE_INDEX', coalesce(v_detail.change_type, 'null'),
+        v_detail.change_type = 'CREATE_INDEX');
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_detail: the plan before the change is there',
+        'not empty', coalesce(length(v_detail.before_plan)::text, '0'),
+        coalesce(length(v_detail.before_plan), 0) > 0);
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_detail: the plan after the change is there',
+        'not empty', coalesce(length(v_detail.after_plan)::text, '0'),
+        coalesce(length(v_detail.after_plan), 0) > 0);
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_detail: both plans are read out in words',
+        'not empty',
+        coalesce(length(v_detail.before_reading)::text, '0') || '/' ||
+        coalesce(length(v_detail.after_reading)::text, '0'),
+        coalesce(length(v_detail.before_reading), 0) > 0
+        AND coalesce(length(v_detail.after_reading), 0) > 0);
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_detail: the benefit says what it was measured on',
+        'not null', coalesce(v_detail.benefit_basis, 'null'),
+        v_detail.benefit_basis IS NOT NULL);
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_detail: the verdict is one of the known values',
+        'known', coalesce(v_detail.verdict, 'null'),
+        coalesce(v_detail.verdict, '') IN ('RECOMMENDED', 'REJECTED',
+                'NO_SIGNIFICANT_CHANGE', 'NOT_USED', 'NOT_COMPARABLE',
+                'ROWS_DIFFER', 'NO_CHANGE_NEEDED'));
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_detail: the rows of a rewrite are compared',
+        'not null',
+        coalesce((SELECT comparison::text FROM sta.before_after_detail(v_sql, v_rewrite, 'REWRITE', 2)), 'null'),
+        (SELECT comparison IS NOT NULL FROM sta.before_after_detail(v_sql, v_rewrite, 'REWRITE', 2)));
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_detail: a statement without a change needs no change',
+        'NO_CHANGE_NEEDED',
+        coalesce((SELECT verdict FROM sta.before_after_detail(v_sql, NULL, 'NONE', 2)), 'null'),
+        (SELECT verdict = 'NO_CHANGE_NEEDED' FROM sta.before_after_detail(v_sql, NULL, 'NONE', 2)));
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_detail: a rewrite that loses rows is not recommended',
+        'ROWS_DIFFER',
+        coalesce((SELECT verdict FROM sta.before_after_detail(v_sql, 'SELECT id FROM sta_qa.pa_fact WHERE dim1_id = 7', 'REWRITE', 2)), 'null'),
+        (SELECT verdict = 'ROWS_DIFFER' FROM sta.before_after_detail(v_sql, 'SELECT id FROM sta_qa.pa_fact WHERE dim1_id = 7', 'REWRITE', 2)));
+
+    INSERT INTO qa_result VALUES (default,
+        'before_after_detail: the buffers of the two plans are counted',
+        'not null',
+        coalesce(v_detail.before_buffers::text, 'null') || '/' ||
+        coalesce(v_detail.after_buffers::text, 'null'),
+        v_detail.before_buffers IS NOT NULL
+        AND v_detail.after_buffers IS NOT NULL);
+
+    ------------------------------------------------------------------
+    -- The action script carries the same information
+    ------------------------------------------------------------------
+    v_script := sta.action_script(v_sql, 'window', true, 10, true, 2);
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the reading of the plan before is in the script',
+        'yes', CASE WHEN v_script LIKE '%Reading of the plan before%' THEN 'yes' ELSE 'no' END,
+        v_script LIKE '%Reading of the plan before%');
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the reading of the plan after is in the script',
+        'yes', CASE WHEN v_script LIKE '%Reading of the plan after%' THEN 'yes' ELSE 'no' END,
+        v_script LIKE '%Reading of the plan after%');
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the benefit is in the script',
+        'yes', CASE WHEN v_script LIKE '%-- Gain:%' THEN 'yes' ELSE 'no' END,
+        v_script LIKE '%-- Gain:%');
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the checks of the rewrite are in the script',
+        'yes', CASE WHEN v_script LIKE '%-- Assumptions:%' THEN 'yes' ELSE 'no' END,
+        v_script LIKE '%-- Assumptions:%');
+
+    INSERT INTO qa_result VALUES (default,
+        'action_script: the verdict is in the script',
+        'yes', CASE WHEN v_script LIKE '%-- Verdict:%' THEN 'yes' ELSE 'no' END,
+        v_script LIKE '%-- Verdict:%');
+
+    ------------------------------------------------------------------
+    -- The report of the workload carries the same information
+    ------------------------------------------------------------------
+    SELECT count(*) INTO v_cnt FROM qa_report
+     WHERE before_reading IS NULL OR btrim(before_reading) = '';
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: every row carries the reading of the plan before',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report
+     WHERE after_reading IS NULL OR btrim(after_reading) = '';
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: every row carries the reading of the plan after',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report WHERE benefit_basis IS NULL;
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: every row says what the benefit was measured on',
+        '0', v_cnt::text, v_cnt = 0);
+
+    SELECT count(*) INTO v_cnt FROM qa_report
+     WHERE change_type = 'REWRITE' AND comparison IS NULL;
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: every rewrite carries the comparison of the rows',
+        '0', v_cnt::text, v_cnt = 0);
 END
 $$;
 
