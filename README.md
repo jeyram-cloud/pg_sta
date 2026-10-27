@@ -518,7 +518,7 @@ pg_sta: 38 finding(s)
       │
       ▼
   ┌───────────────────────────────────────────────────────────┐
-  │  SQL advisory layer (sql/pg_sta--0.1.5.sql)               │
+  │  SQL advisory layer (sql/pg_sta--0.1.6.sql)               │
   │    workload_advice()  plan_advice()  stats_advice()      │
   │    index_advice()     validate()     recommendations()   │
   │    action_plan()      action_script()                    │
@@ -563,13 +563,14 @@ pg_sta/
 ├── pg_sta.control           extension control file
 ├── src/pg_sta.c             C core: queryid, normalisation, EXPLAIN, server info
 ├── sql/
-│   ├── pg_sta--0.1.5.sql    the advisory engine (schema "sta")
-│   ├── pg_sta--0.1.0--0.1.5.sql   upgrade path from 0.1.0
-│   ├── pg_sta--0.1.1--0.1.5.sql   upgrade path from 0.1.1
-│   ├── pg_sta--0.1.2--0.1.5.sql   upgrade path from 0.1.2
-│   ├── pg_sta--0.1.3--0.1.5.sql   upgrade path from 0.1.3
-│   ├── pg_sta--0.1.4--0.1.5.sql   upgrade path from 0.1.4
-│   ├── pg_sta--0.1.5--0.1.4.sql   downgrade path back to 0.1.4
+│   ├── pg_sta--0.1.6.sql    the advisory engine (schema "sta")
+│   ├── pg_sta--0.1.0--0.1.6.sql   upgrade path from 0.1.0
+│   ├── pg_sta--0.1.1--0.1.6.sql   upgrade path from 0.1.1
+│   ├── pg_sta--0.1.2--0.1.6.sql   upgrade path from 0.1.2
+│   ├── pg_sta--0.1.3--0.1.6.sql   upgrade path from 0.1.3
+│   ├── pg_sta--0.1.4--0.1.6.sql   upgrade path from 0.1.4
+│   ├── pg_sta--0.1.5--0.1.6.sql   upgrade path from 0.1.5
+│   ├── pg_sta--0.1.6--0.1.5.sql   downgrade path back to 0.1.5
 │   ├── pg_sta.sql           regression test
 │   ├── orders_workload.sql  a 10-statement workload for the demo schema
 │   ├── sample_data.sql      demo schema: orders, customers, workload
@@ -590,7 +591,7 @@ pg_sta/
 │   └── installcheck.sh      run the regression suite
 ├── test/
 │   ├── qa_setup.sql         deliberate-defect fixture, split into phases
-│   ├── qa_assertions.sql    232 assertions
+│   ├── qa_assertions.sql    247 assertions
 │   └── run_qa.sh            the QA runner
 ├── packaging/pg_sta.spec    RPM package
 └── docs/                    the documentation set
@@ -602,7 +603,7 @@ pg_sta/
 
 ```bash
 make installcheck PG_CONFIG=/usr/pgsql-17/bin/pg_config   # regression suite
-make qa                                                     # QA suite (232 assertions)
+make qa                                                     # QA suite (247 assertions)
 ```
 
 The QA suite seeds a database with **deliberate defects** — an unanalysed

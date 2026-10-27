@@ -42,6 +42,14 @@ CHANGED = [
     "sta._sql_outer_relations",
     "sta._sql_column_type",
     "sta.plan_advice",
+    "sta._strip_outer_parens",
+    "sta._split_conjuncts",
+    "sta._split_equality",
+    "sta._expr_column",
+    "sta._expr_func",
+    "sta._plan_aliases",
+    "sta._alias_column",
+    "sta._join_index_candidates",
     "sta.index_advice",
     "sta.statement_advice",
     "sta._raw_statement",
@@ -63,6 +71,7 @@ CHANGED = [
     "sta._plan_reading_lines",
     "sta.plan_explanation",
     "sta.statement_explanation",
+    "sta._clean_statement",
     "sta._compare_results",
     "sta.assumption_checks",
     "sta._plan_change_matrix",
@@ -88,6 +97,8 @@ CHANGED = [
 DROPPED = [
     "sta.action_script(text, text, boolean, integer)",
     "sta._measure_change(text, text, text, integer)",
+    "sta._measure_change(text, text, text, integer, text)",
+    "sta.before_after_detail(text, text, text, integer)",
     "sta.before_after_report(text, text, integer, integer, boolean)",
 ]
 

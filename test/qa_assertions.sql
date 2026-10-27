@@ -2197,6 +2197,191 @@ END
 $$;
 
 -- -------------------------------------------------------------------------
+-- The advice about the key of a join
+--
+-- The condition of a join is the only place where the key of the join is
+-- written down, and a join between two relations without an index is the
+-- case in which an index pays off the most.  The advisor has to look at
+-- the condition of the join, and it has to recognise that the same
+-- function on both sides of the condition can be dropped.
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_cnt     int;
+    v_ddl     text;
+    v_pattern text;
+    v_new     text;
+    v_before  bigint;
+    v_after   bigint;
+    v_sql     constant text :=
+        'SELECT count(*) FROM sta_qa.join_left l JOIN sta_qa.join_right r '
+        'ON md5(l.id::text) = md5(r.id::text)';
+BEGIN
+    -- The index candidate comes from the condition of the join.
+    SELECT count(*) INTO v_cnt
+    FROM sta.index_advice(v_sql) a
+    WHERE a.relation = 'sta_qa.join_left'
+      AND a.columns = ARRAY['id'];
+    INSERT INTO qa_result VALUES (default,
+        'index advice: the key of the join is proposed as an index',
+        '>=1', v_cnt::text, v_cnt >= 1);
+
+    -- Both sides of the join get a candidate.
+    SELECT count(*) INTO v_cnt
+    FROM sta.index_advice(v_sql) a
+    WHERE a.relation IN ('sta_qa.join_left', 'sta_qa.join_right');
+    INSERT INTO qa_result VALUES (default,
+        'index advice: both sides of the join get a candidate',
+        '2', v_cnt::text, v_cnt = 2);
+
+    -- The candidate says that the function has to go before the index on
+    -- the column can serve the condition.
+    SELECT a.suggested_ddl INTO v_ddl
+    FROM sta.index_advice(v_sql) a
+    WHERE a.relation = 'sta_qa.join_left';
+    INSERT INTO qa_result VALUES (default,
+        'index advice: the candidate is an index on the column itself',
+        'ON sta_qa.join_left (id)',
+        coalesce(v_ddl, 'null'),
+        v_ddl LIKE '%(id)%' AND v_ddl NOT LIKE '%md5(%');
+
+    -- The rewrite rule for a function that wraps the key of the join.
+    SELECT r.pattern, r.rewritten_sql INTO v_pattern, v_new
+    FROM sta.rewrite_advice(v_sql) r
+    WHERE r.pattern = 'FUNCTION_WRAPPED_JOIN_KEY'
+    ORDER BY r.finding_id
+    LIMIT 1;
+    INSERT INTO qa_result VALUES (default,
+        'rewrite advice: the function on both sides of the join is found',
+        'FUNCTION_WRAPPED_JOIN_KEY', coalesce(v_pattern, 'null'),
+        v_pattern = 'FUNCTION_WRAPPED_JOIN_KEY');
+
+    INSERT INTO qa_result VALUES (default,
+        'rewrite advice: the rewritten statement compares the columns directly',
+        'l.id = r.id',
+        coalesce(v_new, 'null'),
+        v_new LIKE '%l.id = r.id%');
+
+    -- The rewrite must not change the result of the statement.
+    EXECUTE v_sql INTO v_before;
+    EXECUTE v_new INTO v_after;
+    INSERT INTO qa_result VALUES (default,
+        'rewrite advice: the rewritten statement returns the same rows',
+        v_before::text, v_after::text, v_before = v_after);
+
+    -- The finding is documented in the catalogue.
+    SELECT count(*) INTO v_cnt FROM sta.advice_catalog() c
+     WHERE c.category = 'rewrite' AND c.finding = 'FUNCTION_WRAPPED_JOIN_KEY';
+    INSERT INTO qa_result VALUES (default,
+        'catalog: the finding about the key of the join is documented',
+        '>=1', v_cnt::text, v_cnt >= 1);
+
+    -- A join whose key is not wrapped in a function is proposed as well.
+    SELECT count(*) INTO v_cnt
+    FROM sta.index_advice(
+        'SELECT count(*) FROM sta_qa.join_left l JOIN sta_qa.join_right r ON l.id = r.id') a
+    WHERE a.relation = 'sta_qa.join_left'
+      AND a.columns = ARRAY['id'];
+    INSERT INTO qa_result VALUES (default,
+        'index advice: a plain join key is proposed as an index',
+        '>=1', v_cnt::text, v_cnt >= 1);
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- The index and the rewrite of the same statement, measured together
+--
+-- On their own the two changes look worthless: an index cannot serve a
+-- comparison that has a function in it, and a rewrite without the index
+-- still reads every row of the relation.  The change the application
+-- really makes is the two of them together, and that is what the advisor
+-- has to measure.
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_cnt     int;
+    v_exists  boolean;
+    v_changed boolean;
+    v_sql     constant text :=
+        'SELECT count(*) FROM sta_qa.join_left l JOIN sta_qa.join_right r '
+        'ON md5(l.id::text) = md5(r.id::text)';
+    v_new     constant text :=
+        'SELECT count(*) FROM sta_qa.join_left l JOIN sta_qa.join_right r ON l.id = r.id';
+BEGIN
+    SELECT r.plan_changed INTO v_changed
+    FROM sta._measure_change(
+        v_sql,
+        v_new,
+        'MIXED', 1, 'FUNCTION_WRAPPED_JOIN_KEY',
+        'CREATE INDEX qa_mix_left ON sta_qa.join_left (id); '
+        || 'CREATE INDEX qa_mix_right ON sta_qa.join_right (id);') r;
+    INSERT INTO qa_result VALUES (default,
+        '_measure_change: the index and the rewrite together change the plan',
+        't', coalesce(v_changed::text, '-'), v_changed);
+
+    SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'qa_mix_left')
+      INTO v_exists;
+    INSERT INTO qa_result VALUES (default,
+        '_measure_change: the index of the mixed change is rolled back',
+        'f', coalesce(v_exists::text, '-'), NOT v_exists);
+
+    SELECT count(*) INTO v_cnt
+    FROM sta.before_after_report(v_sql, 'window', 1, 5, false) r
+    WHERE r.change_type = 'MIXED';
+    INSERT INTO qa_result VALUES (default,
+        'before_after_report: the index and the rewrite are measured together',
+        '>=1', v_cnt::text, v_cnt >= 1);
+END
+$$;
+
+-- -------------------------------------------------------------------------
+-- A statement that ends with a semicolon and a newline
+-- -------------------------------------------------------------------------
+-- The statement of the application is often read from a file, and it then
+-- ends with ";\n".  The comparison of the rows has to work anyway: a
+-- statement that keeps its semicolon cannot be embedded in a command.
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_cmp    jsonb;
+    v_status text;
+    v_detail text;
+BEGIN
+    INSERT INTO qa_result VALUES (default,
+        '_clean_statement: the whitespace and the semicolon are removed',
+        'SELECT 1', sta._clean_statement(E'  SELECT 1;\n'),
+        sta._clean_statement(E'  SELECT 1;\n') = 'SELECT 1');
+
+    SELECT sta._compare_results(
+               'SELECT id FROM sta_qa.join_left ORDER BY id;' || E'\n',
+               'SELECT id FROM sta_qa.join_left ORDER BY id')
+      INTO v_cmp;
+
+    INSERT INTO qa_result VALUES (default,
+        '_compare_results: a statement that ends with a semicolon and a newline is compared',
+        'no error', coalesce(v_cmp->>'error', 'no error'),
+        NOT (v_cmp ? 'error'));
+
+    INSERT INTO qa_result VALUES (default,
+        '_compare_results: the two statements return the same rows',
+        't', coalesce((v_cmp->>'rows_identical')::text, '-'),
+        coalesce((v_cmp->>'rows_identical')::boolean, false));
+
+    SELECT a.status, a.detail INTO v_status, v_detail
+    FROM sta.assumption_checks('FUNCTION_WRAPPED_JOIN_KEY',
+             'SELECT count(*) FROM sta_qa.join_left l JOIN sta_qa.join_right r'
+             || ' ON md5(l.id::text) = md5(r.id::text);' || E'\n',
+             'SELECT count(*) FROM sta_qa.join_left l JOIN sta_qa.join_right r ON l.id = r.id') a
+    WHERE a.assumption = 'The rewrite returns the same rows as the original.';
+
+    INSERT INTO qa_result VALUES (default,
+        'assumption_checks: the check of the rows of a statement that ends with a newline is not an error',
+        'PASS', coalesce(v_status, 'PASS'),
+        coalesce(v_status, 'PASS') <> 'ERROR');
+END
+$$;
+
+-- -------------------------------------------------------------------------
 -- Final report
 -- -------------------------------------------------------------------------
 -- Emitted unaligned with '|' as the separator so that test/run_qa.sh can

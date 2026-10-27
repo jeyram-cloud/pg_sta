@@ -382,3 +382,37 @@ SELECT g, (g % 100) + 1, (g % 100) + 1 FROM generate_series(1, 50000) g;
 ANALYZE sta_qa.pa_dim1;
 ANALYZE sta_qa.pa_dim2;
 ANALYZE sta_qa.pa_fact;
+
+-- ---------------------------------------------------------------------------
+-- The fixture of the join advice
+--
+-- Two relations without any index that are joined on a column that both
+-- sides wrap in a function.  The plan of the statement has no filter on
+-- the scans -- the condition of the join is the only place where the key
+-- of the join is written down -- so the index candidates have to come
+-- from the condition of the join, and the function has to be found in
+-- the text of the statement.
+-- ---------------------------------------------------------------------------
+DROP TABLE IF EXISTS sta_qa.join_left, sta_qa.join_right CASCADE;
+
+CREATE TABLE sta_qa.join_left (
+    id   bigint NOT NULL,
+    name text
+);
+
+CREATE TABLE sta_qa.join_right (
+    id     bigint NOT NULL,
+    amount numeric
+);
+
+INSERT INTO sta_qa.join_left (id, name)
+SELECT g, 'name ' || g FROM generate_series(1, 5000) g;
+
+INSERT INTO sta_qa.join_right (id, amount)
+SELECT g, (g % 97)::numeric FROM generate_series(1, 5000) g;
+
+ALTER TABLE sta_qa.join_left  SET (autovacuum_enabled = false);
+ALTER TABLE sta_qa.join_right SET (autovacuum_enabled = false);
+
+ANALYZE sta_qa.join_left;
+ANALYZE sta_qa.join_right;

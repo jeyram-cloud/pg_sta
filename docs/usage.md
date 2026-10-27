@@ -43,6 +43,177 @@ validate it**.
 
 ---
 
+## 0.1 The eight steps, end to end
+
+This is the shortest path from "the statement is already running in the
+database" to "the statement is tuned and the gain is measured".
+
+Throughout the examples:
+
+```bash
+CTL="sudo -u postgres /var/lib/pgsql/pg_sta/scripts/pg_sta_ctl --database appdb"
+SQL="$(cat /tmp/payroll.sql)"        # the statement, exactly as the app runs it
+```
+
+### Step 1 — the extension must exist in the database that holds the data
+
+```bash
+sudo -u postgres psql -X -d appdb -c \
+  "CREATE EXTENSION IF NOT EXISTS pg_sta; CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+sudo -u postgres psql -X -d appdb -c \
+  "SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_sta','pg_stat_statements');"
+```
+
+`pg_stat_statements` is the workload source; `pg_sta` is the advisor.
+`pg_stat_statements` must also be in `shared_preload_libraries` (see
+[Prerequisites](#1-prerequisites)).
+
+### Step 2 — run the statement in that same database
+
+The advisor learns from `pg_stat_statements`, so the statement has to have
+really run, **in the same database** (`pg_stat_statements` is filtered by
+`current_database()`):
+
+```bash
+sudo -u postgres psql -X -d appdb -f /tmp/payroll.sql
+```
+
+Check that the server has seen it:
+
+```sql
+SELECT queryid, calls, round(total_exec_time::numeric, 1) AS ms
+FROM pg_stat_statements
+WHERE query ILIKE '%employee_master%';
+```
+
+### Step 3 — take a snapshot of the workload
+
+```bash
+$CTL collect
+```
+
+or, in SQL:
+
+```sql
+SELECT * FROM sta.collect();
+```
+
+One call writes one snapshot: the statements of `pg_stat_statements`, the
+table statistics and the index list of every table. Nothing is deleted.
+
+### Step 4 — ask the advice for that statement
+
+```bash
+$CTL index   "$SQL"     # the index candidates, with the DDL
+$CTL rewrite "$SQL"     # the rewrites, with the rewritten statement
+$CTL plan    "$SQL"     # what is wrong with the plan, and why
+$CTL stats              # the statistics of the tables
+```
+
+The same functions are available in SQL, which is the way to read one row at
+a time:
+
+```sql
+SELECT * FROM sta.index_advice($sql$SELECT ...$sql$);
+SELECT * FROM sta.rewrite_advice($sql$SELECT ...$sql$);
+SELECT * FROM sta.plan_advice($sql$SELECT ...$sql$);
+```
+
+The text you pass must name relations that exist in the `search_path` of
+that database — otherwise pg_sta reports `relation "..." does not exist`,
+because it cannot resolve what the statement reads.
+
+### Step 5 — get the action plan and the runnable script
+
+```bash
+$CTL actions "$SQL"                 # the change: DDL, VACUUM/ANALYZE, rewrites
+$CTL script  "$SQL" > /tmp/fix.sql  # the same, as one runnable file
+$CTL script --no-plans "$SQL" > /tmp/fix.sql   # without the EXPLAIN plans
+```
+
+Read the whole script before running it: every step states why it is there,
+what it buys, what it costs and how it is checked.
+
+### Step 6 — measure the change: the plan before and after, and the gain
+
+```bash
+$CTL before-after "$SQL" "CREATE INDEX CONCURRENTLY idx_employee_master_employee_id ON employee_master (employee_id)"
+```
+
+or, in SQL:
+
+```sql
+SELECT * FROM sta.before_after_detail(
+  $sql$SELECT ...$sql$,
+  'CREATE INDEX CONCURRENTLY idx_employee_master_employee_id ON employee_master (employee_id)');
+```
+
+The change type is worked out from the change itself when it is not given
+(`AUTO`), and the change is applied inside a sub-transaction and **rolled
+back**: the measurement never leaves an index behind.
+
+For the whole workload, one row per statement and per change:
+
+```bash
+$CTL before-after-report --statements 5
+```
+
+```sql
+SELECT * FROM sta.before_after_report();
+```
+
+Every row carries `before_plan` / `after_plan` (the EXPLAIN output),
+`before_reading` / `after_reading` (the same plan written out in words),
+`before_ms` / `after_ms`, `improvement_pct` and `benefit_basis`, the buffer
+split, and the row-by-row comparison (`rows_match`, `comparison`) that proves
+the rewrite returns the same rows.
+
+From 0.1.6 there is a third change type, `MIXED`: the index **and** the
+rewrite are applied together and measured together. That is the row that
+answers the real question when a statement needs both — for example a join
+whose key is wrapped in a function such as `md5()`: the index alone cannot
+serve `md5(a) = md5(b)`, and the rewrite alone still reads every row.
+
+### Step 7 — read the result
+
+| Column | What it tells you |
+|---|---|
+| `before_plan`, `after_plan` | the EXPLAIN output before and after the change |
+| `before_reading`, `after_reading` | the same plan in words |
+| `before_ms`, `after_ms` | the measured execution time |
+| `improvement_pct`, `benefit_basis` | the gain, and what it was measured on |
+| `before_buffers`, `after_buffers` | the blocks read, with the hit/read split |
+| `rows_match`, `comparison` | `ROWS_MATCH` or `ROWS_DIFFER` — the proof the rewrite is safe |
+| `plan_changed`, `verdict` | `BENEFICIAL`, `NEUTRAL`, `REGRESSION` or `NOT_APPLICABLE` |
+
+### Step 8 — apply the change and measure again
+
+```bash
+sudo -u postgres psql -X -v ON_ERROR_STOP=1 -d appdb -f /tmp/fix.sql
+$CTL collect
+$CTL before-after-report --statements 5
+```
+
+The second measurement must show the plan and the timing that the report
+predicted. If it does not, the workload changed — collect again and compare.
+
+### The identifiers, the Oracle way
+
+```sql
+SELECT sta.sql_id('SELECT * FROM orders WHERE customer_id = 42');    -- hash of the exact text
+SELECT sta.sql_hash('SELECT * FROM orders WHERE customer_id = 42');  -- hash of the normalised text
+SELECT sta.queryid('SELECT * FROM orders WHERE customer_id = 42');   -- pg_stat_statements.queryid
+SELECT * FROM sta.queryid_info('SELECT * FROM orders WHERE customer_id = 42');
+```
+
+```bash
+$CTL sqlid "$SQL"
+```
+
+See [Statement identifiers](#8-statement-identifiers-the-oracle-way).
+
+---
+
 ## 1. Prerequisites
 
 | Requirement | Version | How to check |
@@ -143,7 +314,7 @@ The developer scripts in `scripts/` do this automatically:
 | Path | Purpose |
 |---|---|
 | `src/pg_sta.c` | the C core: plan capture, query ids, server introspection |
-| `sql/pg_sta--0.1.5.sql` | the advisory engine, the catalogue and the sample tables |
+| `sql/pg_sta--0.1.6.sql` | the advisory engine, the catalogue and the sample tables |
 | `sql/pg_sta.sql` | the regression suite (pg_regress) |
 | `sql/sample_data.sql`, `sql/sample_workload.sql` | the demo schema and the demo workload |
 | `scripts/pg_sta_ctl` | the command line client |
@@ -189,7 +360,7 @@ sudo make PG_CONFIG=/usr/pgsql-17/bin/pg_config install
 
 - `pg_sta.so` → `$(pg_config --pkglibdir)`
 - `pg_sta.control` → `$(pg_config --sharedir)/extension`
-- `pg_sta--0.1.5.sql` → `$(pg_config --sharedir)/extension`
+- `pg_sta--0.1.6.sql` → `$(pg_config --sharedir)/extension`
 
 ---
 
@@ -258,7 +429,7 @@ The advisor is upgraded in place, so the collected workload and the audit
 trail survive the upgrade:
 
 ```sql
-ALTER EXTENSION pg_sta UPDATE TO '0.1.5';
+ALTER EXTENSION pg_sta UPDATE TO '0.1.6';
 ```
 
 A script is provided for every step of the way, so a database on any
@@ -266,20 +437,21 @@ older version can reach the newest one in one command:
 
 | Script | From | To |
 |---|---|---|
-| `pg_sta--0.1.0--0.1.5.sql` | 0.1.0 | 0.1.5 |
-| `pg_sta--0.1.1--0.1.5.sql` | 0.1.1 | 0.1.5 |
-| `pg_sta--0.1.2--0.1.5.sql` | 0.1.2 | 0.1.5 |
-| `pg_sta--0.1.3--0.1.5.sql` | 0.1.3 | 0.1.5 |
-| `pg_sta--0.1.4--0.1.5.sql` | 0.1.4 | 0.1.5 |
+| `pg_sta--0.1.0--0.1.6.sql` | 0.1.0 | 0.1.6 |
+| `pg_sta--0.1.1--0.1.6.sql` | 0.1.1 | 0.1.6 |
+| `pg_sta--0.1.2--0.1.6.sql` | 0.1.2 | 0.1.6 |
+| `pg_sta--0.1.3--0.1.6.sql` | 0.1.3 | 0.1.6 |
+| `pg_sta--0.1.4--0.1.6.sql` | 0.1.4 | 0.1.6 |
+| `pg_sta--0.1.5--0.1.6.sql` | 0.1.5 | 0.1.6 |
 
 The newest version can also be taken back one step:
 
 ```sql
-ALTER EXTENSION pg_sta UPDATE TO '0.1.4';
+ALTER EXTENSION pg_sta UPDATE TO '0.1.5';
 ```
 
-The downgrade script `pg_sta--0.1.5--0.1.4.sql` restores the bodies of
-the 0.1.4 functions and drops the ones that 0.1.5 added. It is needed
+The downgrade script `pg_sta--0.1.6--0.1.5.sql` restores the bodies of
+the 0.1.5 functions and drops the ones that 0.1.6 added. It is needed
 because a function body cannot be replaced by `CREATE OR REPLACE` when
 its arguments **or its return type** changed.
 
@@ -739,9 +911,18 @@ so the change in the execution strategy is visible, not just its timing.
 | `ANALYZE` | `ANALYZE table` | the same statement with fresh statistics |
 | `VACUUM_ANALYZE` | `VACUUM [ANALYZE] table` | the same statement with fresh statistics |
 | `REWRITE` | the rewritten statement | the **new text** |
+| `MIXED` | the rewritten statement, with the index it needs | the **new text**, with the index in place |
 | `NONE` | nothing | the same statement again (the noise of a second measurement) |
 
 `AUTO` — the default — detects the type from the text of the change.
+
+`MIXED` is the measurement that answers the question the other two cannot:
+on their own, an index does nothing for a statement that compares
+`md5(column)` with `md5(column)`, and a rewrite without the index still
+reads every row. The report measures the two changes together — the
+rewritten statement with the index in place — because that is the change
+the application really makes. The index is created inside the measurement
+and rolled back afterwards.
 
 Two restrictions apply:
 
@@ -1399,7 +1580,7 @@ UPDATE sta.threshold SET value = 0.05 WHERE name = 'dead_tuple_ratio';
 To restore the defaults, re-run the extension script:
 
 ```sql
-\i /usr/pgsql-17/share/extension/pg_sta--0.1.5.sql
+\i /usr/pgsql-17/share/extension/pg_sta--0.1.6.sql
 ```
 
 ### 11.1 Server settings

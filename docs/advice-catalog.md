@@ -544,12 +544,40 @@ because they enforce constraints rather than serve the workload.
 
 **The rule.** A column is proposed only when
 
-1. it appears in the filter of a sequential scan in the plan,
+1. it appears in the filter of a sequential scan in the plan **or in the
+   condition of a join**,
 2. it is a **real column** of the relation, and
 3. it is **not already the leading column** of an existing index.
 
 Condition 3 is what keeps the tool from proposing an index that already
 exists under a different name.
+
+**The key of a join.** The condition of a join is the only place where
+the key of the join is written down: a join between two relations that
+have no index is read with a scan of both relations and a sort or a hash
+of the join key, and the scans carry no filter at all. The advisor reads
+the condition of every join of the plan (`Join Key`, `Hash Cond`,
+`Merge Cond` and `Join Filter`) and proposes an index on the columns
+that both sides compare.
+
+When the condition applies a function to the column, the index is
+proposed on the **column**, not on the expression, and the rationale says
+so:
+
+```
+The join compares (md5((e.employee_id)::text)) with (md5((p.employee_id)::text)).
+The column employee_id is a real column of employee_master, which has about
+10000091 rows, and no index of the relation starts with it.  The condition
+applies md5() to the column, so an index on the column cannot serve it until
+the condition is rewritten to compare the columns directly; if the condition
+keeps the function, the index has to be built on the expression:
+CREATE INDEX CONCURRENTLY idx_employee_master_employee_id_md5
+    ON public.employee_master (md5(employee_id));
+```
+
+The rewrite rule `FUNCTION_WRAPPED_JOIN_KEY` removes the function from
+both sides of the condition, which is what makes the index on the column
+usable.
 
 ---
 
@@ -574,6 +602,7 @@ SELECT * FROM sta.rewrite_statement(
 |---|---|---|---|
 | `IMPLICIT_CAST` | HIGH | The filtered column is cast to `text` (`col::text = 'x'`), so an index on the column cannot be used. | The cast is removed and the literal is cast to the column's own type. |
 | `NON_SARGABLE_PREDICATE` | HIGH | A function is applied to the filtered column (`lower(col) = 'x'`, `date(ts) = '…'`), so a B-tree index on the column cannot be used. | The function is removed from the column side, or the expression is moved to a sargable form. |
+| `FUNCTION_WRAPPED_JOIN_KEY` | HIGH | The same function is applied to the columns of **both** sides of a join (`md5(a.id::text) = md5(b.id::text)`), so it is computed once for every row of both relations and the columns cannot be indexed. | The function is removed from both sides, so the columns are compared directly (`a.id = b.id`). The confidence is MEDIUM, because a function that is not injective (such as `md5`) can give the same result for two different values; the comparison of the rows before and after the rewrite proves whether that happens in this data. |
 | `LEADING_WILDCARD_LIKE` | HIGH | The pattern starts with `%` (`col LIKE '%x%'`), so a B-tree index cannot be used. | A trigram index on the column is proposed (`CREATE EXTENSION IF NOT EXISTS pg_trgm;` plus the `CREATE INDEX`). |
 | `OR_TO_IN` | MEDIUM | The same column is tested twice with `OR` (`col = a OR col = b`), which the planner cannot serve with one index lookup. | The `OR` becomes an `IN` list on the column. |
 | `NOT_IN_TO_NOT_EXISTS` | MEDIUM | `NOT IN (SELECT …)` is evaluated as a hashed anti-join over the whole subquery. | The predicate becomes `NOT EXISTS` with a correlated subquery (the NULL semantics are checked first). |

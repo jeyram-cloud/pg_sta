@@ -11,14 +11,15 @@
 EXTENSION   = pg_sta
 MODULE_big  = pg_sta
 OBJS        = src/pg_sta.o
-EXTVERSION  = 0.1.5
+EXTVERSION  = 0.1.6
 DATA        = sql/pg_sta--$(EXTVERSION).sql \
            sql/pg_sta--0.1.0--$(EXTVERSION).sql \
            sql/pg_sta--0.1.1--$(EXTVERSION).sql \
            sql/pg_sta--0.1.2--$(EXTVERSION).sql \
            sql/pg_sta--0.1.3--$(EXTVERSION).sql \
            sql/pg_sta--0.1.4--$(EXTVERSION).sql \
-           sql/pg_sta--$(EXTVERSION)--0.1.4.sql \
+           sql/pg_sta--0.1.5--$(EXTVERSION).sql \
+           sql/pg_sta--$(EXTVERSION)--0.1.5.sql \
            sql/pg_sta--0.1.0--0.1.1.sql
 REGRESS     = pg_sta
 
@@ -42,7 +43,8 @@ upgrade-script:
 	python3 scripts/gen_upgrade.py 0.1.2 $(EXTVERSION)
 	python3 scripts/gen_upgrade.py 0.1.3 $(EXTVERSION)
 	python3 scripts/gen_upgrade.py 0.1.4 $(EXTVERSION)
-	python3 scripts/gen_upgrade.py --downgrade $(EXTVERSION) 0.1.4
+	python3 scripts/gen_upgrade.py 0.1.5 $(EXTVERSION)
+	python3 scripts/gen_upgrade.py --downgrade $(EXTVERSION) 0.1.5
 
 .PHONY: lint
 lint:
@@ -52,7 +54,8 @@ lint:
 	        sql/pg_sta--0.1.2--$(EXTVERSION).sql \
 	        sql/pg_sta--0.1.3--$(EXTVERSION).sql \
 	        sql/pg_sta--0.1.4--$(EXTVERSION).sql \
-	        sql/pg_sta--$(EXTVERSION)--0.1.4.sql
+	        sql/pg_sta--0.1.5--$(EXTVERSION).sql \
+	        sql/pg_sta--$(EXTVERSION)--0.1.5.sql
 
 .PHONY: qa
 qa:
