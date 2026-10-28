@@ -36,6 +36,7 @@ only the extension interfaces PostgreSQL provides:
 | What does the change do to every statement of the workload? | `sta.before_after_report()` |
 | What is the Oracle-style id of my statement? | `sta.sql_id()`, `sta.sql_hash()` |
 | What is the `pg_stat_statements` id of my statement? | `sta.queryid_info()` |
+| Can I get the report the Oracle SQL Tuning Advisor writes? | `sta.tuning_report()` |
 
 Every finding carries the same envelope: **what was observed**, **what to
 do**, **the expected benefit**, **the cost**, and **the exact steps to
@@ -323,7 +324,7 @@ The developer scripts in `scripts/` do this automatically:
 | Path | Purpose |
 |---|---|
 | `src/pg_sta.c` | the C core: plan capture, query ids, server introspection |
-| `sql/pg_sta--0.1.6.sql` | the advisory engine, the catalogue and the sample tables |
+| `sql/pg_sta--0.1.7.sql` | the advisory engine, the catalogue and the sample tables |
 | `sql/pg_sta.sql` | the regression suite (pg_regress) |
 | `sql/sample_data.sql`, `sql/sample_workload.sql` | the demo schema and the demo workload |
 | `scripts/pg_sta_ctl` | the command line client |
@@ -369,7 +370,7 @@ sudo make PG_CONFIG=/usr/pgsql-17/bin/pg_config install
 
 - `pg_sta.so` → `$(pg_config --pkglibdir)`
 - `pg_sta.control` → `$(pg_config --sharedir)/extension`
-- `pg_sta--0.1.6.sql` → `$(pg_config --sharedir)/extension`
+- `pg_sta--0.1.7.sql` → `$(pg_config --sharedir)/extension`
 
 ---
 
@@ -438,7 +439,7 @@ The advisor is upgraded in place, so the collected workload and the audit
 trail survive the upgrade:
 
 ```sql
-ALTER EXTENSION pg_sta UPDATE TO '0.1.6';
+ALTER EXTENSION pg_sta UPDATE TO '0.1.7';
 ```
 
 A script is provided for every step of the way, so a database on any
@@ -446,12 +447,13 @@ older version can reach the newest one in one command:
 
 | Script | From | To |
 |---|---|---|
-| `pg_sta--0.1.0--0.1.6.sql` | 0.1.0 | 0.1.6 |
-| `pg_sta--0.1.1--0.1.6.sql` | 0.1.1 | 0.1.6 |
-| `pg_sta--0.1.2--0.1.6.sql` | 0.1.2 | 0.1.6 |
-| `pg_sta--0.1.3--0.1.6.sql` | 0.1.3 | 0.1.6 |
-| `pg_sta--0.1.4--0.1.6.sql` | 0.1.4 | 0.1.6 |
-| `pg_sta--0.1.5--0.1.6.sql` | 0.1.5 | 0.1.6 |
+| `pg_sta--0.1.0--0.1.7.sql` | 0.1.0 | 0.1.7 |
+| `pg_sta--0.1.1--0.1.7.sql` | 0.1.1 | 0.1.7 |
+| `pg_sta--0.1.2--0.1.7.sql` | 0.1.2 | 0.1.7 |
+| `pg_sta--0.1.3--0.1.7.sql` | 0.1.3 | 0.1.7 |
+| `pg_sta--0.1.4--0.1.7.sql` | 0.1.4 | 0.1.7 |
+| `pg_sta--0.1.5--0.1.7.sql` | 0.1.5 | 0.1.7 |
+| `pg_sta--0.1.6--0.1.7.sql` | 0.1.6 | 0.1.7 |
 
 The newest version can also be taken back one step:
 
@@ -459,8 +461,8 @@ The newest version can also be taken back one step:
 ALTER EXTENSION pg_sta UPDATE TO '0.1.5';
 ```
 
-The downgrade script `pg_sta--0.1.6--0.1.5.sql` restores the bodies of
-the 0.1.5 functions and drops the ones that 0.1.6 added. It is needed
+The downgrade script `pg_sta--0.1.7--0.1.6.sql` restores the bodies of
+the 0.1.6 functions and drops the ones that 0.1.7 added. It is needed
 because a function body cannot be replaced by `CREATE OR REPLACE` when
 its arguments **or its return type** changed.
 
@@ -1301,6 +1303,7 @@ pg_sta_ctl: the pg_sta extension is not installed in database 'appdb'.
 | `script [SQL]` | the whole plan as one commented, runnable file (`--plans` / `--no-plans`) |
 | `before-after SQL [CHANGE]` | the plan before and after a change, and the benefit of the change |
 | `before-after-report [SQL]` | the plan before and after the change, for every statement of the workload |
+| `tuning-report SQL [--out DIR]` | the tuning report of one statement, written as the four files of the Oracle SQL Tuning Advisor |
 | `plan-explanation SQL` | the plan of a statement, written out in words |
 | `queryid SQL` | the canonical query id and its normalised text |
 | `sqlid SQL` | every identifier of a statement: query id, SQL id, SQL hash |
@@ -1549,6 +1552,65 @@ Connection settings come from the environment:
 | `PG_STA_SSH_KEY` | `~/.vagrant.d/insecure_private_key` | SSH private key |
 | `PG_STA_PGDATABASE` | `postgres` | default database |
 
+### 10.5 The tuning report, the way Oracle writes it
+
+The Oracle SQL Tuning Advisor writes the result of an analysis as a set of
+report files.  `tuning-report` writes the same set for a statement:
+
+```console
+$ ./scripts/pg_sta_ctl -d appdb tuning-report \
+      "SELECT * FROM orders WHERE customer_id = 42" \
+      --out /tmp/report --iterations 3
+wrote /tmp/report/2556230741.txt
+wrote /tmp/report/2556230741_indx.txt
+wrote /tmp/report/2556230741_multiple_plan.txt
+wrote /tmp/report/2556230741_sql_profile.txt
+```
+
+| File | What it holds |
+|---|---|
+| `<sql_id>.txt` | the general information, every finding, the additional information and the explain plans |
+| `<sql_id>_indx.txt` | the findings about the indexes and the plan that was measured with the index |
+| `<sql_id>_multiple_plan.txt` | the findings about the indexes, the finding about the alternative plans and the plans themselves |
+| `<sql_id>_sql_profile.txt` | the finding about the recommended change, the finding about the alternative plans and the explain plans |
+
+The same four files can be produced from SQL:
+
+```sql
+SELECT sta.tuning_report('SELECT * FROM orders WHERE customer_id = 42', 3, 60);
+```
+
+The function returns all four files as one text, separated by the markers
+`>>> FILE: <name>` and `<<< END FILE: <name>`, so that the statement is
+measured once instead of four times.
+
+| Flag | Meaning |
+|---|---|
+| `--out DIR` | the directory the four files are written to (default: the current directory) |
+| `--iterations N` | how often each statement is measured (default 3) |
+| `--time-limit N` | the time limit of the analysis, in seconds (default 60) |
+
+Every file opens with the general information section of the Oracle report:
+
+```
+RECOMMENDATIONS
+===============================================================================
+GENERAL INFORMATION SECTION
+-------------------------------------------------------------------------------
+    SQL ID          : 2556230741
+    SQL Text        : SELECT * FROM orders WHERE customer_id = 42
+    Schema Name     : public
+```
+
+and closes with the sections the Oracle report carries — `FINDINGS SECTION`,
+`ADDITIONAL INFORMATION SECTION`, `EXPLAIN PLANS SECTION` and
+`ALTERNATIVE PLANS SECTION`.
+
+The numbers in the report are real measurements: every candidate change is
+applied in a subtransaction, the statement is measured with and without it,
+and the change is rolled back.  The report says so in its additional
+information section.
+
 ---
 
 ## 11. Tuning the thresholds
@@ -1589,7 +1651,7 @@ UPDATE sta.threshold SET value = 0.05 WHERE name = 'dead_tuple_ratio';
 To restore the defaults, re-run the extension script:
 
 ```sql
-\i /usr/pgsql-17/share/extension/pg_sta--0.1.6.sql
+\i /usr/pgsql-17/share/extension/pg_sta--0.1.7.sql
 ```
 
 ### 11.1 Server settings

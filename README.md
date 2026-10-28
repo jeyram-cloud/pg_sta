@@ -49,6 +49,7 @@ cannot be validated is not a recommendation.
 | **Before / after** | `sta.plan_before_after()` shows the plan of a statement **before** a change and **after** it, with the times and the buffer counts of both; `sta.before_after_benefit()` adds the benefit, the verdict and the plan change matrix |
 | **Before / after report** | `sta.before_after_report()` measures **every** recommended change against the statement it belongs to and returns the plan before, the plan after and the gain — for the whole workload, with every change rolled back |
 | **Before / after detail** | `sta.before_after_detail()` measures one statement against one change and returns the whole detail row: both plans, both readings, the gain and its basis, the buffer split, the row-by-row comparison and the assumption checks |
+| **Tuning report** | `sta.tuning_report()` writes a statement out the way the Oracle SQL Tuning Advisor writes it: the general information, the findings, the explain plans, the alternative plans and the recommended change — as the four files `<sql_id>.txt`, `<sql_id>_indx.txt`, `<sql_id>_multiple_plan.txt` and `<sql_id>_sql_profile.txt` |
 | **Plan reading** | `sta.plan_explanation()` turns a plan into plain English — what each step does, what it costs and where the time goes; `sta.statement_explanation()` adds the statement text and the top three findings |
 | **Statement ids** | `sta.sql_id()` and `sta.sql_hash()` give the Oracle-style `SQL_ID` and `SQL_HASH`; `sta.queryid_info()` gives the `pg_stat_statements` query id, the normalised text and the workload of the statement |
 | **Explainability** | Every finding carries structured `evidence` (JSONB), not just prose |
@@ -518,7 +519,7 @@ pg_sta: 38 finding(s)
       │
       ▼
   ┌───────────────────────────────────────────────────────────┐
-  │  SQL advisory layer (sql/pg_sta--0.1.6.sql)               │
+  │  SQL advisory layer (sql/pg_sta--0.1.7.sql)               │
   │    workload_advice()  plan_advice()  stats_advice()      │
   │    index_advice()     validate()     recommendations()   │
   │    action_plan()      action_script()                    │
@@ -563,14 +564,15 @@ pg_sta/
 ├── pg_sta.control           extension control file
 ├── src/pg_sta.c             C core: queryid, normalisation, EXPLAIN, server info
 ├── sql/
-│   ├── pg_sta--0.1.6.sql    the advisory engine (schema "sta")
-│   ├── pg_sta--0.1.0--0.1.6.sql   upgrade path from 0.1.0
-│   ├── pg_sta--0.1.1--0.1.6.sql   upgrade path from 0.1.1
-│   ├── pg_sta--0.1.2--0.1.6.sql   upgrade path from 0.1.2
-│   ├── pg_sta--0.1.3--0.1.6.sql   upgrade path from 0.1.3
-│   ├── pg_sta--0.1.4--0.1.6.sql   upgrade path from 0.1.4
-│   ├── pg_sta--0.1.5--0.1.6.sql   upgrade path from 0.1.5
-│   ├── pg_sta--0.1.6--0.1.5.sql   downgrade path back to 0.1.5
+│   ├── pg_sta--0.1.7.sql    the advisory engine (schema "sta")
+│   ├── pg_sta--0.1.0--0.1.7.sql   upgrade path from 0.1.0
+│   ├── pg_sta--0.1.1--0.1.7.sql   upgrade path from 0.1.1
+│   ├── pg_sta--0.1.2--0.1.7.sql   upgrade path from 0.1.2
+│   ├── pg_sta--0.1.3--0.1.7.sql   upgrade path from 0.1.3
+│   ├── pg_sta--0.1.4--0.1.7.sql   upgrade path from 0.1.4
+│   ├── pg_sta--0.1.5--0.1.7.sql   upgrade path from 0.1.5
+│   ├── pg_sta--0.1.6--0.1.7.sql   upgrade path from 0.1.6
+│   ├── pg_sta--0.1.7--0.1.6.sql   downgrade path back to 0.1.6
 │   ├── pg_sta.sql           regression test
 │   ├── orders_workload.sql  a 10-statement workload for the demo schema
 │   ├── sample_data.sql      demo schema: orders, customers, workload

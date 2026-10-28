@@ -43,6 +43,12 @@
 #                            the plan before and after the change for every
 #                            statement of the workload, with the benefit of
 #                            every change
+#   tuning-report SQL [--out DIR] [--iterations N] [--time-limit N]
+#                            the tuning report of one statement, written the
+#                            way the Oracle SQL Tuning Advisor writes its
+#                            report: the main report and the three files
+#                            with the index finding, the alternative plans
+#                            and the recommended change
 #   plan-explanation SQL      the plan of a statement, written out in words
 #   validate DDL SQL         measure a proposed index against the current plan
 #   queryid SQL              the canonical query id of a statement
@@ -80,6 +86,8 @@
 #   pg_sta_ctl --database appdb script "SELECT * FROM orders WHERE customer_id = 42" > fix.sql
 #   pg_sta_ctl --database appdb script --no-plans > fix.sql
 #   pg_sta_ctl --database appdb --statements 5 before-after-report
+#   pg_sta_ctl --database appdb tuning-report \
+#       "SELECT * FROM orders WHERE customer_id = 42" --out ./sta-report
 #   pg_sta_ctl --database appdb before-after \
 #       "SELECT * FROM orders WHERE customer_id = 42" \
 #       "CREATE INDEX idx_orders_customer ON orders (customer_id)"
@@ -108,6 +116,7 @@ LIMIT=50
 STATEMENTS=10
 WINDOW=window
 ITERATIONS=3
+TIME_LIMIT=60
 ANALYZE=false
 PLANS=true
 SQL_ARG=""
@@ -119,6 +128,7 @@ TARGET_ARG=""
 ADVICE_ARG=""
 STASH_CMD=""
 STASH_NAME=""
+OUT_DIR="."
 QID_ARG=""
 EXTRA_ARGS=()
 
@@ -142,6 +152,8 @@ while [ $# -gt 0 ]; do
         --statements)  STATEMENTS="$2"; shift 2 ;;
         --window)      WINDOW="$2"; shift 2 ;;
         --iterations)  ITERATIONS="$2"; shift 2 ;;
+        --time-limit)  TIME_LIMIT="$2"; shift 2 ;;
+        --out)         OUT_DIR="$2"; shift 2 ;;
         --analyze)     ANALYZE=true; shift ;;
         --plans)       PLANS=true; shift ;;
         --no-plans)    PLANS=false; shift ;;
@@ -174,6 +186,18 @@ case "$COMMAND" in
     sqlid)
         [ $# -ge 1 ] || die "sqlid needs a SQL statement"
         SQL_ARG="$1"; shift ;;
+    tuning-report)
+        [ $# -ge 1 ] || die "tuning-report needs a SQL statement"
+        SQL_ARG="$1"; shift
+        # The options of the command may also follow the statement.
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --out)         OUT_DIR="$2"; shift 2 ;;
+                --iterations)  ITERATIONS="$2"; shift 2 ;;
+                --time-limit)  TIME_LIMIT="$2"; shift 2 ;;
+                *)             die "unknown option for tuning-report: $1" ;;
+            esac
+        done ;;
     stash)
         [ $# -ge 1 ] || die "stash needs a subcommand (list, create, drop, show, set, remove)"
         STASH_CMD="$1"; shift
@@ -565,6 +589,34 @@ script)
     cat <<SQL | run_sql "-q -A -t"
 SELECT sta.action_script($lit, '$WINDOW', $ANALYZE, $LIMIT, $PLANS, $ITERATIONS);
 SQL
+    ;;
+
+tuning-report)
+    # The Oracle style report.  The function returns the four files as one
+    # text, separated by the markers ">>> FILE: <name>" and
+    # "<<< END FILE: <name>"; they are written to the output directory
+    # here, with the names the Oracle report uses.
+    lit=$(sql_literal "$SQL_ARG")
+    mkdir -p "$OUT_DIR"
+    tmp=$(mktemp)
+    if ! printf 'SELECT sta.tuning_report(%s, %s, %s);\n' "$lit" "$ITERATIONS" "$TIME_LIMIT" \
+            | run_sql "-q -A -t" > "$tmp"; then
+        rm -f "$tmp"
+        die "the tuning report failed"
+    fi
+    # Every file is written under the name of its marker; the list of the
+    # files is printed on stdout, one file per line.
+    awk -v dir="$OUT_DIR" '
+        /^>>> FILE: /     { name = dir "/" substr($0, 11); next }
+        /^<<< END FILE: / {
+            if (name != "") { close(name); print name; name = "" }
+            next
+        }
+        name != ""         { print > name }
+    ' "$tmp" | while read -r f; do
+        printf 'wrote %s\n' "$f"
+    done
+    rm -f "$tmp"
     ;;
 
 before-after-report)

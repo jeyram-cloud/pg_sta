@@ -318,7 +318,7 @@ The rules that keep them safe:
 
 ## 9. Adding a new finding
 
-1. Add the rule to the relevant advice function in `sql/pg_sta--0.1.6.sql`.
+1. Add the rule to the relevant advice function in `sql/pg_sta--0.1.7.sql`.
 2. Add the row to the `sta.advice_catalog` table in the same file — the
    severity of a finding should come from the catalogue, not from a
    literal in the function body.

@@ -2,7 +2,7 @@
 %global pgversion 17
 
 Name:           pg_sta
-Version:        0.1.4
+Version:        0.1.7
 Release:        1%{?dist}
 Summary:        PostgreSQL SQL Tuning Advisor
 
@@ -54,11 +54,15 @@ make install DESTDIR=%{buildroot} PG_CONFIG=/usr/pgsql-%{pgversion}/bin/pg_confi
 %files
 %{_libdir}/pg_sta.so
 %{_datadir}/pgsql/extension/pg_sta.control
-%{_datadir}/pgsql/extension/pg_sta--0.1.4.sql
-%{_datadir}/pgsql/extension/pg_sta--0.1.0--0.1.4.sql
-%{_datadir}/pgsql/extension/pg_sta--0.1.1--0.1.4.sql
-%{_datadir}/pgsql/extension/pg_sta--0.1.2--0.1.4.sql
-%{_datadir}/pgsql/extension/pg_sta--0.1.3--0.1.4.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.7.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.0--0.1.7.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.1--0.1.7.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.2--0.1.7.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.3--0.1.7.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.4--0.1.7.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.5--0.1.7.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.6--0.1.7.sql
+%{_datadir}/pgsql/extension/pg_sta--0.1.7--0.1.6.sql
 %{_datadir}/pgsql/extension/pg_sta--0.1.0--0.1.1.sql
 %license LICENSE
 %doc README.md
@@ -67,6 +71,20 @@ make install DESTDIR=%{buildroot} PG_CONFIG=/usr/pgsql-%{pgversion}/bin/pg_confi
 %doc docs/pg19-compatibility.md
 
 %changelog
+* Tue Oct 28 2026 Jey <jey@example.com> - 0.1.7-1
+- The tuning report: sta.tuning_report() writes a statement out the way
+  the Oracle SQL Tuning Advisor writes it, as the four files <sql_id>.txt,
+  <sql_id>_indx.txt, <sql_id>_multiple_plan.txt and <sql_id>_sql_profile.txt.
+  The client command "tuning-report" writes them to a directory.
+
+* Sun Oct 27 2026 Jey <jey@example.com> - 0.1.6-1
+- The index and the rewrite are measured together, and the row-by-row
+  comparison of the two result sets is fixed.
+
+* Sun Oct 27 2026 Jey <jey@example.com> - 0.1.5-1
+- Every finding now carries the plan before the change, the plan after it
+  and the benefit of the change, in percent.
+
 * Sun Oct 26 2026 Jey <jey@example.com> - 0.1.4-1
 - The plan before and after the change, for every statement of the
   workload: sta.before_after_report() measures every change the advisor

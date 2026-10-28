@@ -297,7 +297,7 @@ changes a server-wide or a database-wide setting.
 
 | Artefact | Location |
 |---|---|
-| Tag catalogue and GUC mapping | `sql/pg_sta--0.1.6.sql`, section "Plan advice tags" |
+| Tag catalogue and GUC mapping | `sql/pg_sta--0.1.7.sql`, section "Plan advice tags" |
 | Advice parser | `sta._advice_split()`, `sta._advice_parse()` |
 | Advice generator | `sta.plan_advice_string()` |
 | Stash tables and API | `sta.advice_stash`, `sta.advice_stash_entry`, `sta.create_stash()` … |

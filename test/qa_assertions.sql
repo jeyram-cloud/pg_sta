@@ -2382,6 +2382,124 @@ END
 $$;
 
 -- -------------------------------------------------------------------------
+-- sta.tuning_report
+--
+-- The Oracle SQL Tuning Advisor writes a statement out as a set of report
+-- files.  sta.tuning_report() produces the same set, as one text that the
+-- client splits on the ">>> FILE:" markers.  These assertions check that
+-- the four files are there, that they are named after the SQL id, and that
+-- every one of them carries the sections the Oracle reports carry.
+-- -------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_report  text;
+    v_main    text;
+    v_indx    text;
+    v_plans   text;
+    v_profile text;
+    v_sqlid   text;
+BEGIN
+    v_report := sta.tuning_report(
+        'SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 42', 1, 60);
+
+    v_sqlid := sta.sql_id('SELECT * FROM sta_qa.pa_fact WHERE dim1_id = 42');
+
+    v_main    := split_part(split_part(v_report, '>>> FILE: ', 2), '<<< END FILE', 1);
+    v_indx    := split_part(split_part(v_report, '>>> FILE: ', 3), '<<< END FILE', 1);
+    v_plans   := split_part(split_part(v_report, '>>> FILE: ', 4), '<<< END FILE', 1);
+    v_profile := split_part(split_part(v_report, '>>> FILE: ', 5), '<<< END FILE', 1);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: the report carries the four file markers',
+        't', (position('>>> FILE: ' || v_sqlid || '.txt' in v_report) > 0
+              AND position('>>> FILE: ' || v_sqlid || '_indx.txt' in v_report) > 0
+              AND position('>>> FILE: ' || v_sqlid || '_multiple_plan.txt' in v_report) > 0
+              AND position('>>> FILE: ' || v_sqlid || '_sql_profile.txt' in v_report) > 0)::text,
+        (position('>>> FILE: ' || v_sqlid || '.txt' in v_report) > 0
+         AND position('>>> FILE: ' || v_sqlid || '_indx.txt' in v_report) > 0
+         AND position('>>> FILE: ' || v_sqlid || '_multiple_plan.txt' in v_report) > 0
+         AND position('>>> FILE: ' || v_sqlid || '_sql_profile.txt' in v_report) > 0)::boolean);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: the four files are closed with the end marker',
+        't', (position('<<< END FILE: ' || v_sqlid || '.txt' in v_report) > 0
+              AND position('<<< END FILE: ' || v_sqlid || '_indx.txt' in v_report) > 0
+              AND position('<<< END FILE: ' || v_sqlid || '_multiple_plan.txt' in v_report) > 0
+              AND position('<<< END FILE: ' || v_sqlid || '_sql_profile.txt' in v_report) > 0)::text,
+        (position('<<< END FILE: ' || v_sqlid || '.txt' in v_report) > 0
+         AND position('<<< END FILE: ' || v_sqlid || '_indx.txt' in v_report) > 0
+         AND position('<<< END FILE: ' || v_sqlid || '_multiple_plan.txt' in v_report) > 0
+         AND position('<<< END FILE: ' || v_sqlid || '_sql_profile.txt' in v_report) > 0)::boolean);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: every file carries the general information section',
+        't', (position('GENERAL INFORMATION SECTION' in v_main) > 0
+              AND position('GENERAL INFORMATION SECTION' in v_indx) > 0
+              AND position('GENERAL INFORMATION SECTION' in v_plans) > 0
+              AND position('GENERAL INFORMATION SECTION' in v_profile) > 0)::text,
+        (position('GENERAL INFORMATION SECTION' in v_main) > 0
+         AND position('GENERAL INFORMATION SECTION' in v_indx) > 0
+         AND position('GENERAL INFORMATION SECTION' in v_plans) > 0
+         AND position('GENERAL INFORMATION SECTION' in v_profile) > 0)::boolean);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: the general information section names the SQL id and the text',
+        't', (position('SQL ID' in v_main) > 0
+              AND position('SQL Text' in v_main) > 0
+              AND position(v_sqlid in v_main) > 0)::text,
+        (position('SQL ID' in v_main) > 0
+         AND position('SQL Text' in v_main) > 0
+         AND position(v_sqlid in v_main) > 0)::boolean);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: the main file carries a findings section',
+        't', (position('FINDINGS SECTION' in v_main) > 0)::text,
+        (position('FINDINGS SECTION' in v_main) > 0)::boolean);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: the main file carries the explain plans section',
+        't', (position('EXPLAIN PLANS SECTION' in v_main) > 0)::text,
+        (position('EXPLAIN PLANS SECTION' in v_main) > 0)::boolean);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: the main file carries the additional information section',
+        't', (position('ADDITIONAL INFORMATION SECTION' in v_main) > 0)::text,
+        (position('ADDITIONAL INFORMATION SECTION' in v_main) > 0)::boolean);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: the index file carries a findings section and a plan',
+        't', (position('FINDINGS SECTION' in v_indx) > 0
+              AND position('Plan hash value' in v_indx) > 0)::text,
+        (position('FINDINGS SECTION' in v_indx) > 0
+         AND position('Plan hash value' in v_indx) > 0)::boolean);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: the alternative plan file carries the alternative plans section',
+        't', (position('ALTERNATIVE PLANS SECTION' in v_plans) > 0)::text,
+        (position('ALTERNATIVE PLANS SECTION' in v_plans) > 0)::boolean);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: the alternative plan file lists the plans it found',
+        't', (position('Alternative Plan Finding' in v_plans) > 0
+              AND position('plan hash' in v_plans) > 0)::text,
+        (position('Alternative Plan Finding' in v_plans) > 0
+         AND position('plan hash' in v_plans) > 0)::boolean);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: the sql profile file carries the recommended change',
+        't', (position('Recommended Change Finding' in v_profile) > 0
+              AND position('Using the recommended change' in v_profile) > 0)::text,
+        (position('Recommended Change Finding' in v_profile) > 0
+         AND position('Using the recommended change' in v_profile) > 0)::boolean);
+
+    INSERT INTO qa_result VALUES (default,
+        'tuning_report: the sql profile file carries the explain plans section',
+        't', (position('EXPLAIN PLANS SECTION' in v_profile) > 0)::text,
+        (position('EXPLAIN PLANS SECTION' in v_profile) > 0)::boolean);
+END
+$$;
+
+-- -------------------------------------------------------------------------
 -- Final report
 -- -------------------------------------------------------------------------
 -- Emitted unaligned with '|' as the separator so that test/run_qa.sh can

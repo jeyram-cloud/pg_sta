@@ -21,7 +21,7 @@ How `pg_sta` is put together and how data flows through it.
 └──────────────────────────┬───────────────────────────────────┘
                            │  narrow C ABI (5 functions)
 ┌──────────────────────────▼───────────────────────────────────┐
-│  Layer 2 — SQL advisory engine   sql/pg_sta--0.1.6.sql      │
+│  Layer 2 — SQL advisory engine   sql/pg_sta--0.1.7.sql      │
 │                                                     (2070 lines)│
 │  Everything that is policy:                                   │
 │    • which observations matter                                │
@@ -125,7 +125,7 @@ advisor:
 
 ---
 
-## 3. The SQL advisory engine (`sql/pg_sta--0.1.6.sql`)
+## 3. The SQL advisory engine (`sql/pg_sta--0.1.7.sql`)
 
 ### 3.1 Schema and objects
 
@@ -402,13 +402,13 @@ Standard PGXS. `Makefile`:
 EXTENSION   = pg_sta
 MODULE_big  = pg_sta
 OBJS        = src/pg_sta.o
-DATA        = sql/pg_sta--0.1.6.sql \
-             sql/pg_sta--0.1.0--0.1.6.sql \
-             sql/pg_sta--0.1.1--0.1.6.sql \
-             sql/pg_sta--0.1.2--0.1.6.sql \
-             sql/pg_sta--0.1.3--0.1.6.sql \
-             sql/pg_sta--0.1.4--0.1.6.sql \
-             sql/pg_sta--0.1.6--0.1.5.sql
+DATA        = sql/pg_sta--0.1.7.sql \
+             sql/pg_sta--0.1.0--0.1.7.sql \
+             sql/pg_sta--0.1.1--0.1.7.sql \
+             sql/pg_sta--0.1.2--0.1.7.sql \
+             sql/pg_sta--0.1.3--0.1.7.sql \
+             sql/pg_sta--0.1.4--0.1.7.sql \
+             sql/pg_sta--0.1.7--0.1.6.sql
 REGRESS     = pg_sta
 REGRESS_OPTS ?= --dbname=pg_sta_regress
 ```
@@ -417,14 +417,14 @@ The upgrade scripts are generated from the base script, so they can never
 drift away from it:
 
 ```bash
-make upgrade-script    # regenerates every pg_sta--<from>--0.1.6.sql
+make upgrade-script    # regenerates every pg_sta--<from>--0.1.7.sql
 ```
 
-`pg_sta--0.1.6--0.1.5.sql` is the **downgrade** script: it restores the
-0.1.5 function bodies and drops the functions that 0.1.6 added or whose
+`pg_sta--0.1.7--0.1.6.sql` is the **downgrade** script: it restores the
+0.1.6 function bodies and drops the functions that 0.1.7 added or whose
 arguments or return type changed. It is what makes an upgrade
 reversible — `ALTER EXTENSION pg_sta UPDATE TO '0.1.4'` then
-`ALTER EXTENSION pg_sta UPDATE TO '0.1.6'` leaves the database with the
+`ALTER EXTENSION pg_sta UPDATE TO '0.1.7'` leaves the database with the
 new bodies.
 
 ```bash

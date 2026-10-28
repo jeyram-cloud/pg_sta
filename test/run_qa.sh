@@ -60,15 +60,10 @@ if [ -f "$ROOT/scripts/lint_sql.py" ]; then
     # checks the scripts that are about to be installed.
     PG_STA_EXTVERSION=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" \
         "$ROOT/pg_sta.control")
+    # Every script of the extension is linted, the base scripts and the
+    # upgrade scripts alike, so that a defect in any of them is found.
     LINT_OUT=$(python3 "$ROOT/scripts/lint_sql.py" \
-        "$ROOT/sql/pg_sta--$PG_STA_EXTVERSION.sql" \
-        "$ROOT/sql/pg_sta--0.1.0--$PG_STA_EXTVERSION.sql" \
-        "$ROOT/sql/pg_sta--0.1.1--$PG_STA_EXTVERSION.sql" \
-        "$ROOT/sql/pg_sta--0.1.2--$PG_STA_EXTVERSION.sql" \
-        "$ROOT/sql/pg_sta--0.1.3--$PG_STA_EXTVERSION.sql" \
-        "$ROOT/sql/pg_sta--0.1.4--$PG_STA_EXTVERSION.sql" \
-        "$ROOT/sql/pg_sta--0.1.5--$PG_STA_EXTVERSION.sql" \
-        "$ROOT/sql/pg_sta--$PG_STA_EXTVERSION--0.1.5.sql" 2>&1)
+        "$ROOT"/sql/pg_sta--*.sql 2>&1)
     if [ $? -ne 0 ]; then
         echo "$LINT_OUT"
         echo "!! the extension scripts do not pass the linter"

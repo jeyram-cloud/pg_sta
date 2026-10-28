@@ -88,6 +88,8 @@ CHANGED = [
     "sta._measure_change",
     "sta.before_after_detail",
     "sta.before_after_report",
+    "sta._tuning_findings",
+    "sta.tuning_report",
 ]
 
 # The functions whose signature changed.  CREATE OR REPLACE cannot change a
